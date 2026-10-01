@@ -1,6 +1,6 @@
 import { Link } from "wouter";
 import { useQuery } from "@tanstack/react-query";
-import { Shirt } from "lucide-react";
+import { Shirt, ExternalLink } from "lucide-react";
 import type { PickView, Session, Crew } from "@shared/schema";
 import { Page, Swatches } from "@/components/shell";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -37,6 +37,22 @@ export default function Closet() {
           </Link>
         ))}
       </div>
+      {q.data && (
+        <aside className="mt-6 rounded-2xl border border-card-border bg-card px-4 py-3" data-testid="card-closet-featured">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Crew favorite this week</p>
+          <a
+            href="https://sovrn.co/v4b8fpj"
+            target="_blank"
+            rel="noopener sponsored"
+            className="mt-1 flex items-center justify-between gap-3 text-sm font-semibold text-primary"
+            data-testid="link-featured-lululemon"
+          >
+            <span>Lululemon Align High-Rise Pant 25"</span>
+            <ExternalLink className="h-4 w-4 shrink-0" />
+          </a>
+          <p className="mt-1 text-[11px] text-muted-foreground">Affiliate link. MMV may earn a commission at no extra cost to you.</p>
+        </aside>
+      )}
     </Page>
   );
 }
