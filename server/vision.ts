@@ -1,5 +1,6 @@
 import fs from "node:fs";
-import type { GarmentItem } from "@shared/schema";
+import type { GarmentItem, GarmentFit } from "@shared/schema";
+import { GARMENT_FITS } from "@shared/schema";
 
 export interface OutfitAnalysis {
   palette: string[];
@@ -45,13 +46,14 @@ export function buildLinks(query: string, brand: string | null): { label: string
 
 const SYSTEM = `You identify activewear and athleisure garments in a photo so friends can coordinate outfits and shop for the pieces.
 Return ONLY compact JSON with this exact shape and nothing else:
-{"summary": string, "palette": string[], "items": [{"category": string, "description": string, "colorName": string, "colorHex": string, "brandGuess": string|null, "searchQuery": string}]}
+{"summary": string, "palette": string[], "items": [{"category": string, "description": string, "colorName": string, "colorHex": string, "brandGuess": string|null, "searchQuery": string, "fit": "womens"|"mens"|"unisex"}]}
 Rules:
 - summary: 6-12 words describing the outfit, e.g. "Black high-rise leggings with sage cropped tank".
 - palette: 2-4 dominant outfit colors as hex, most prominent first. Ignore skin, hair and background.
 - items: one entry per visible garment or shoe (sports bra, tank, leggings, shorts, hoodie, jacket, shoes, socks, hat, bag). 2-6 items.
 - brandGuess: only if a logo or unmistakable signature is visible; otherwise null. Never guess.
-- searchQuery: 4-8 words a shopper would type to find this exact style, including color, fit and brand if known. Example: "lululemon align high rise legging black 25".
+- searchQuery: 4-8 words a shopper would type to find this exact style, including color, fit and brand if known. Example: "lululemon align high rise legging black 25". Do NOT add "women's"/"men's" here; use the fit field.
+- fit: the department this piece is sold in, judged from the garment's own cut and styling, never from the wearer. "womens" for sports bras, leggings with a high-rise yoga cut, cropped tanks, skorts, bike shorts with a women's cut, flared pants; "mens" for boxy tees, basketball/7" lined shorts, men's compression gear or cuts clearly from a men's line; "unisex" for hoodies, crewnecks, socks, hats, bags, sneakers and whenever you are not sure. Default to "unisex".
 - colorHex: a real hex like #1F1F1F.`;
 
 const GEMINI_HOST = "https://generativelanguage.googleapis.com";
@@ -110,7 +112,15 @@ export async function analyzeOutfit(image: Buffer | string, mimeType: string): P
   return normalizeAnalysis(JSON.parse(json));
 }
 
-function normalizeAnalysis(parsed: { summary?: string; palette?: string[]; items?: Omit<GarmentItem, "links">[] }): OutfitAnalysis {
+/** Coerce whatever the model returned for `fit` to a known value; anything unknown/missing → "unisex". */
+export function normalizeFit(v: unknown): GarmentFit {
+  const s = typeof v === "string" ? v.toLowerCase().replace(/['\s]/g, "") : "";
+  if (s === "women" || s === "womens" || s === "female" || s === "ladies") return "womens";
+  if (s === "men" || s === "mens" || s === "male") return "mens";
+  return (GARMENT_FITS as readonly string[]).includes(s) ? (s as GarmentFit) : "unisex";
+}
+
+function normalizeAnalysis(parsed: { summary?: string; palette?: string[]; items?: (Omit<GarmentItem, "links" | "fit"> & { fit?: unknown })[] }): OutfitAnalysis {
   const palette = (parsed.palette ?? []).filter((h) => /^#[0-9a-f]{6}$/i.test(h)).slice(0, 4);
   const items: GarmentItem[] = (parsed.items ?? []).slice(0, 6).map((it) => ({
     category: it.category ?? "item",
@@ -119,6 +129,8 @@ function normalizeAnalysis(parsed: { summary?: string; palette?: string[]; items
     colorHex: /^#[0-9a-f]{6}$/i.test(it.colorHex ?? "") ? it.colorHex : "#888888",
     brandGuess: it.brandGuess || null,
     searchQuery: it.searchQuery || `${it.colorName ?? ""} ${it.description ?? it.category ?? ""}`.trim(),
+    fit: normalizeFit(it.fit),
+    // Stored un-hinted; storage.pickView re-derives Compare prices / Amazon urls from the hinted query at read time.
     links: buildLinks(it.searchQuery || `${it.colorName ?? ""} ${it.description ?? ""}`.trim(), it.brandGuess || null),
   }));
 

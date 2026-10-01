@@ -18,7 +18,7 @@ name: keep-alive
 
 on:
   schedule:
-    - cron: "3,13,23,33,43,53 * * * *"   # every 10 min, off the top of the hour to avoid GitHub's busiest moment
+    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"   # every 5 min, off the top of the hour (GitHub often delays scheduled runs)
     - cron: "17 9 * * 1"                 # weekly (Mon 09:17 UTC) Supabase activity ping
   workflow_dispatch: {}                  # lets you run it by hand from the Actions tab
 
