@@ -45,7 +45,7 @@ export type { Offer } from "@shared/schema";
  */
 
 const TTL_MS = 24 * 60 * 60 * 1000;
-const PROVIDER_TIMEOUT_MS = 8000;
+const PROVIDER_TIMEOUT_MS = 20000; // SerpApi with direct_link=true regularly needs >8s; a timeout still burns one budget unit
 const MAX_OFFERS = 6;
 
 export type LookupSource = "memo" | "db" | "provider" | "stale" | "budget" | "none";
