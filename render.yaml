@@ -26,10 +26,18 @@ services:
         value: production
       - key: SUPABASE_BUCKET
         value: outfits
-      - key: DATABASE_URL
-        sync: false          # Supabase "Transaction pooler" URI (port 6543) with the DB password filled in
+      # Database: paste ONLY the password into SUPABASE_DB_PASSWORD. The app assembles the URL.
+      # Host/user come from Supabase -> Connect -> "Session pooler" (IPv4-proxied for free).
+      - key: SUPABASE_DB_HOST
+        value: aws-0-us-east-1.pooler.supabase.com
+      - key: SUPABASE_DB_PORT
+        value: "5432"
+      - key: SUPABASE_DB_USER
+        value: postgres.sfvtipxgzozjvlvbvhvj
+      - key: SUPABASE_DB_PASSWORD
+        sync: false          # Supabase database password. SECRET. (Alternative: set DATABASE_URL instead.)
       - key: SUPABASE_URL
-        sync: false          # https://<project-ref>.supabase.co
+        value: https://sfvtipxgzozjvlvbvhvj.supabase.co
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false          # Supabase secret key (sb_secret_...) or legacy service_role JWT. SECRET.
       - key: GEMINI_API_KEY

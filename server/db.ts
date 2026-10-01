@@ -21,8 +21,26 @@ export function getDb(): Promise<Db> {
   return dbPromise;
 }
 
+/**
+ * Resolve the Postgres URL. Prefer DATABASE_URL; otherwise assemble it from
+ * SUPABASE_DB_PASSWORD (+ optional SUPABASE_DB_HOST/USER/PORT) so a non-developer
+ * only has to paste the raw password into one field — special characters included.
+ */
+function resolveDatabaseUrl(): string | undefined {
+  const direct = process.env.DATABASE_URL?.trim();
+  if (direct && /^postgres(ql)?:\/\//.test(direct) && !direct.includes("[YOUR-PASSWORD]")) return direct;
+  if (direct) console.warn("[db] DATABASE_URL is not a valid postgres:// URL; ignoring it");
+  const pw = process.env.SUPABASE_DB_PASSWORD?.trim();
+  if (!pw) return undefined;
+  const user = process.env.SUPABASE_DB_USER?.trim() || "postgres";
+  const host = process.env.SUPABASE_DB_HOST?.trim() || "localhost";
+  const port = process.env.SUPABASE_DB_PORT?.trim() || "5432";
+  const name = process.env.SUPABASE_DB_NAME?.trim() || "postgres";
+  return `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(pw)}@${host}:${port}/${name}`;
+}
+
 async function init(): Promise<Db> {
-  const url = process.env.DATABASE_URL;
+  const url = resolveDatabaseUrl();
   let db: Db;
   if (url) {
     const { drizzle } = await import("drizzle-orm/postgres-js");
