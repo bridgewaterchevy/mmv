@@ -82,34 +82,64 @@ export async function analyzeOutfit(image: Buffer | string, mimeType: string): P
   const payload = JSON.stringify({
     systemInstruction: { parts: [{ text: SYSTEM }] },
     contents: [{ role: "user", parts: [{ inlineData: { mimeType: mediaType, data } }, { text: "Identify the garments. JSON only." }] }],
-    generationConfig: { temperature: 0.2, maxOutputTokens: 1200, responseMimeType: "application/json" },
+    generationConfig: {
+      temperature: 0.2,
+      // maxOutputTokens INCLUDES thinking tokens on Gemini 3.x; the old 1200 cap truncated real outfit
+      // photos mid-JSON ("Unexpected end of JSON input"). Keep thinking low and leave headroom.
+      // https://ai.google.dev/gemini-api/docs/thinking
+      maxOutputTokens: 8192,
+      responseMimeType: "application/json",
+      thinkingConfig: { thinkingLevel: "low" },
+    },
   });
+  // Some models reject thinkingConfig; retry those without it.
+  const payloadNoThinking = payload.replace(/,\s*"thinkingConfig":\{[^}]*\}/, "");
 
   // Try each model in order; retry transient 429/503 once per model with a short pause.
-  type GeminiBody = { candidates?: { content?: { parts?: { text?: string }[] } }[] };
-  let body: GeminiBody | null = null;
+  type GeminiBody = { candidates?: { finishReason?: string; content?: { parts?: { text?: string; thought?: boolean }[] } }[] };
   let lastErr = "";
-  outer: for (const model of GEMINI_MODELS) {
-    const { url, headers } = geminiTarget(model.trim());
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: payload });
-      if (res.ok) {
-        body = (await res.json()) as GeminiBody;
-        break outer;
+  for (const rawModel of GEMINI_MODELS) {
+    const model = rawModel.trim();
+    const { url, headers } = geminiTarget(model);
+    let useThinkingCfg = true;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers },
+        body: useThinkingCfg ? payload : payloadNoThinking,
+      });
+      if (!res.ok) {
+        const errText = (await res.text()).slice(0, 200);
+        lastErr = `Gemini ${model} ${res.status}: ${errText}`;
+        if (res.status === 400 && useThinkingCfg && /thinking/i.test(errText)) {
+          useThinkingCfg = false; // model doesn't accept thinkingConfig → retry plain
+          continue;
+        }
+        if (res.status === 429 || res.status === 503) {
+          await new Promise((r) => setTimeout(r, 1500));
+          continue;
+        }
+        break; // 404 / 400 etc: move to next model
       }
-      lastErr = `Gemini ${model} ${res.status}: ${(await res.text()).slice(0, 200)}`;
-      if (res.status === 429 || res.status === 503) {
-        await new Promise((r) => setTimeout(r, 1500));
-        continue;
+      const body = (await res.json()) as GeminiBody;
+      const cand = body.candidates?.[0];
+      const text = (cand?.content?.parts ?? []).filter((p) => !p.thought).map((p) => p.text ?? "").join("").trim();
+      const start = text.indexOf("{");
+      const end = text.lastIndexOf("}");
+      if (start >= 0 && end > start) {
+        try {
+          return normalizeAnalysis(JSON.parse(text.slice(start, end + 1)));
+        } catch (e) {
+          lastErr = `Gemini ${model}: unparseable JSON (${(e as Error).message}; finishReason=${cand?.finishReason ?? "?"})`;
+        }
+      } else {
+        lastErr = `Gemini ${model}: empty output (finishReason=${cand?.finishReason ?? "?"})`;
       }
-      break; // 404 / 400 etc: move to next model
+      console.warn(`[vision] ${lastErr}; trying next model`);
+      break; // bad output from this model → next model
     }
   }
-  if (!body) throw new Error(lastErr || "Gemini unavailable");
-  const result: GeminiBody = body;
-  const text = (result.candidates?.[0]?.content?.parts ?? []).map((p) => p.text ?? "").join("").trim();
-  const json = text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1);
-  return normalizeAnalysis(JSON.parse(json));
+  throw new Error(lastErr || "Gemini unavailable");
 }
 
 /** Coerce whatever the model returned for `fit` to a known value; anything unknown/missing → "unisex". */
