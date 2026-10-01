@@ -81,6 +81,8 @@ const DDL = [
   )`,
   // Existing databases (Supabase) created before shop_for existed: add the column in place.
   `ALTER TABLE users ADD COLUMN IF NOT EXISTS shop_for TEXT`,
+  // Public profile blurb for Discover (PATCH /api/me { bio }).
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT`,
   `CREATE TABLE IF NOT EXISTS crews (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
@@ -179,6 +181,50 @@ const DDL = [
   `ALTER TABLE feedback ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'problem'`,
   `CREATE INDEX IF NOT EXISTS feedback_created_idx ON feedback (created_at DESC)`,
   `CREATE INDEX IF NOT EXISTS feedback_user_idx ON feedback (user_id)`,
+  // Discover (server/discover.ts): one public post per pick; likes, follows and reports hang off it.
+  `CREATE TABLE IF NOT EXISTS posts (
+    id SERIAL PRIMARY KEY,
+    pick_id INTEGER NOT NULL UNIQUE REFERENCES picks(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL,
+    caption TEXT,
+    vibe TEXT NOT NULL DEFAULT 'other',
+    photo_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    like_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active',
+    status_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS posts_status_created_idx ON posts (status, created_at DESC, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS posts_status_vibe_idx ON posts (status, vibe)`,
+  `CREATE INDEX IF NOT EXISTS posts_top_idx ON posts (status, like_count DESC, created_at DESC, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS posts_user_idx ON posts (user_id, status)`,
+  `CREATE TABLE IF NOT EXISTS post_likes (
+    id SERIAL PRIMARY KEY,
+    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS post_likes_post_user_uq ON post_likes (post_id, user_id)`,
+  `CREATE INDEX IF NOT EXISTS post_likes_user_idx ON post_likes (user_id)`,
+  `CREATE TABLE IF NOT EXISTS follows (
+    id SERIAL PRIMARY KEY,
+    follower_id INTEGER NOT NULL,
+    followee_id INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS follows_pair_uq ON follows (follower_id, followee_id)`,
+  `CREATE INDEX IF NOT EXISTS follows_followee_idx ON follows (followee_id)`,
+  `CREATE TABLE IF NOT EXISTS post_reports (
+    id SERIAL PRIMARY KEY,
+    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    user_id INTEGER,
+    reporter_key TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS post_reports_post_reporter_uq ON post_reports (post_id, reporter_key)`,
+  `CREATE INDEX IF NOT EXISTS post_reports_created_idx ON post_reports (created_at DESC)`,
 ];
 
 async function migrate(db: Db) {
@@ -221,7 +267,7 @@ async function migratePickPhotos(db: Db) {
         INSERT INTO pick_photos (pick_id, path, position, analysis_status, analysis_error, items, palette, summary, analyzed_at, created_at)
         VALUES (${r.id as number}, ${String(r.photo_path)}, 0, ${status}, ${(r.analysis_error as string | null) ?? null},
                 ${JSON.stringify(parseJson(r.items))}::jsonb, ${JSON.stringify(parseJson(r.palette))}::jsonb, NULL,
-                ${analyzedAt}, ${createdAt})`);
+                ${analyzedAt ? analyzedAt.toISOString() : null}::timestamptz, ${createdAt.toISOString()}::timestamptz)`);
       n++;
     } catch (err) {
       console.error(`[db] pick_photos back-fill failed for pick ${String(r.id)}`, err);
