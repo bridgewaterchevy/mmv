@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react";
-import { LifeBuoy, Share, SlidersHorizontal } from "lucide-react";
+import { Lightbulb, LifeBuoy, Share, SlidersHorizontal } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/lib/auth";
 import { useToast } from "@/hooks/use-toast";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Avatar } from "@/components/shell";
 import { isStandalone, SHOP_FOR_OPTIONS, type ShopFor } from "@/lib/invite";
-import { openReportProblem } from "@/components/report-problem";
+import { openReportProblem, openSuggestion } from "@/components/report-problem";
 
 /**
  * Segmented control for the "shop for" preference. Tapping the selected segment again clears it
@@ -109,6 +109,18 @@ export function AccountMenu() {
           >
             <LifeBuoy className="h-4 w-4 text-primary" aria-hidden />
             Report a problem
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              openSuggestion();
+            }}
+            className="flex w-full items-center gap-2.5 rounded-xl px-2 py-2 text-left text-sm font-medium hover-elevate"
+            data-testid="button-suggest-idea"
+          >
+            <Lightbulb className="h-4 w-4 text-primary" aria-hidden />
+            Suggest an idea
           </button>
         </div>
       </PopoverContent>

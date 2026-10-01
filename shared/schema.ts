@@ -227,13 +227,17 @@ export const priceBudget = pgTable("price_budget", {
   calls: integer("calls").notNull().default(0),
 });
 
-// ---------- Feedback ("Report a problem", see server/feedback.ts + server/github.ts) ----------
+// ---------- Feedback ("Report a problem" / "Suggest an idea", see server/feedback.ts + server/github.ts) ----------
 export const FEEDBACK_STATUSES = ["open", "resolved"] as const;
 export type FeedbackStatus = (typeof FEEDBACK_STATUSES)[number];
+/** "problem" = bug report (GitHub "[Report]", label user-report); "suggestion" = idea ("[Idea]", label suggestion). */
+export const FEEDBACK_KINDS = ["problem", "suggestion"] as const;
+export type FeedbackKind = (typeof FEEDBACK_KINDS)[number];
 
 export const feedback = pgTable("feedback", {
   id: serial("id").primaryKey(),
   userId: integer("user_id").notNull(),
+  kind: text("kind").$type<FeedbackKind>().notNull().default("problem"),
   message: text("message").notNull(), // 1–2000 chars
   page: text("page"), // route / URL the user was on
   userAgent: text("user_agent"),
@@ -246,7 +250,7 @@ export const feedback = pgTable("feedback", {
 });
 export type Feedback = typeof feedback.$inferSelect;
 
-/** One row of GET /api/feedback (admin). `user` is null if the reporter was deleted. */
+/** One row of GET /api/feedback (admin); includes `kind`. `user` is null if the reporter was deleted. */
 export interface FeedbackReport extends Feedback {
   user: { id: number; name: string; handle: string } | null;
 }
@@ -254,14 +258,17 @@ export interface FeedbackReport extends Feedback {
 /** Response of POST /api/feedback. */
 export interface FeedbackCreated {
   id: number;
+  kind: FeedbackKind;
   githubIssueUrl: string | null;
 }
 
 /**
  * Body of POST /api/feedback (JSON or multipart form fields; multipart may add an image file in
  * the `screenshot` field, ≤ 5 MB, JPG/PNG/WebP/GIF/HEIC). Empty strings are treated as "not set".
+ * `kind` defaults to "problem"; anything other than "problem" | "suggestion" is a 400.
  */
 export const feedbackBodySchema = zod.object({
+  kind: zod.enum(FEEDBACK_KINDS, { message: 'kind must be "problem" or "suggestion"' }).default("problem"),
   message: zod.string().trim().min(1, "Tell us what went wrong").max(2000, "Keep the message under 2000 characters"),
   page: zod.string().trim().max(500).optional().nullable(),
   userAgent: zod.string().trim().max(1000).optional().nullable(),

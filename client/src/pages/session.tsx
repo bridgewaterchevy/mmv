@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { Camera, Lock, Unlock, ExternalLink, Sparkles, Trash2, Send, Tag, ChevronDown, ShoppingBag } from "lucide-react";
 import type { SessionView, PickView, PublicUser, GarmentItem } from "@shared/schema";
@@ -9,7 +9,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Drawer, DrawerContent, DrawerHeader, DrawerTitle } from "@/components/ui/drawer";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { apiJson, apiRequest, assetUrl, queryClient } from "@/lib/queryClient";
+import { apiJson, apiRequest, assetUrl, errorStatus, queryClient } from "@/lib/queryClient";
+import { PhotoSourcePicker, UNSUPPORTED_PHOTO_MESSAGE } from "@/components/photo-picker";
 import { useAuth } from "@/lib/auth";
 import { useToast } from "@/hooks/use-toast";
 import { formatDate, matchScore, type MatchLevel } from "@/lib/color";
@@ -212,7 +213,6 @@ function UploadDialog({ open, onClose, sessionId, hasExisting, onDone }: { open:
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [note, setNote] = useState("");
-  const inputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
 
   const m = useMutation({
@@ -238,7 +238,12 @@ function UploadDialog({ open, onClose, sessionId, hasExisting, onDone }: { open:
             : "Your crew can see it. We couldn't make out the pieces; a clearer, well-lit photo works best.",
       });
     },
-    onError: (e: Error) => toast({ title: e.message, variant: "destructive" }),
+    onError: (e: Error) => {
+      // 400 from the picks route means the bytes weren't a photo we can decode (e.g. an odd HEIF container).
+      // Size limits come back with their own message, so only translate the format case.
+      const friendly = errorStatus(e) === 400 && !/large|size|limit/i.test(e.message);
+      toast({ title: friendly ? UNSUPPORTED_PHOTO_MESSAGE : e.message, variant: "destructive" });
+    },
   });
 
   function reset() {
@@ -246,6 +251,8 @@ function UploadDialog({ open, onClose, sessionId, hasExisting, onDone }: { open:
     setPreview(null);
     setNote("");
   }
+  // HEIC/HEIF or an empty type still goes through: iOS usually hands web inputs a JPEG, and when it
+  // doesn't the server sniffs the bytes and tells us. Blocking here would strand real photos.
   function onFile(f: File | undefined) {
     if (!f) return;
     setFile(f);
@@ -258,22 +265,27 @@ function UploadDialog({ open, onClose, sessionId, hasExisting, onDone }: { open:
     <Dialog open={open} onOpenChange={(o) => { if (!o) { reset(); onClose(); } }}>
       <DialogContent className="max-w-sm rounded-2xl">
         <DialogHeader><DialogTitle className="font-display text-xl">{hasExisting ? "Change my pick" : "Post my pick"}</DialogTitle></DialogHeader>
-        <input ref={inputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={(e) => onFile(e.target.files?.[0])} data-testid="input-photo" />
-        <button
-          type="button"
-          onClick={() => inputRef.current?.click()}
-          className="relative flex aspect-[3/4] w-full items-center justify-center overflow-hidden rounded-2xl border border-dashed border-border bg-muted"
-          data-testid="button-choose-photo"
-        >
-          {preview ? (
-            <img src={preview} alt="Outfit preview" className="h-full w-full object-cover" />
-          ) : (
-            <div className="text-center text-sm text-muted-foreground">
-              <Camera className="mx-auto mb-2 h-7 w-7" />
-              Tap to take or choose a photo
-            </div>
-          )}
-        </button>
+        <PhotoSourcePicker onFile={onFile} testIdPrefix="photo">
+          <button
+            type="button"
+            className="relative flex aspect-[3/4] w-full items-center justify-center overflow-hidden rounded-2xl border border-dashed border-border bg-muted"
+            data-testid="button-choose-photo"
+          >
+            {preview ? (
+              <>
+                <img src={preview} alt="Outfit preview" className="h-full w-full object-cover" />
+                <span className="absolute bottom-2 left-1/2 -translate-x-1/2 rounded-full bg-background/90 px-3 py-1 text-xs font-medium backdrop-blur" data-testid="text-replace-photo">
+                  Tap to replace photo
+                </span>
+              </>
+            ) : (
+              <div className="text-center text-sm text-muted-foreground">
+                <Camera className="mx-auto mb-2 h-7 w-7" />
+                Tap to take or choose a photo
+              </div>
+            )}
+          </button>
+        </PhotoSourcePicker>
         <Input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note (optional): 'wearing the new set'" maxLength={200} data-testid="input-note" />
         <p className="flex items-start gap-1.5 text-xs text-muted-foreground"><Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" /> We'll pull out the colors and each piece, then link where to shop it.</p>
         {hasExisting && <p className="rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground" data-testid="text-replace-warning">Replacing your pick clears your crew's reactions and unlocks it.</p>}

@@ -1,5 +1,9 @@
 /**
- * "Report a problem" → GitHub issue.
+ * "Report a problem" / "Suggest an idea" → GitHub issue.
+ *
+ * Per kind: problem → title "[Report] …", label user-report, heading "What happened";
+ *           suggestion → title "[Idea] …", label suggestion, heading "The idea" (no "Last error"
+ *           section unless one was captured).
  *
  * Enabled when GITHUB_ISSUES_TOKEN is set (fine-grained PAT with **Issues: Read and write** on the target
  * repo, see docs/RUNBOOK.md). GITHUB_ISSUES_REPO is "owner/repo" (default "bridgewaterchevy/mmv").
@@ -12,10 +16,21 @@
  *   MOCK_GITHUB_ISSUE_JSON  canned response body; `{ "html_url": "..." }` succeeds, `{ "status": 500 }`
  *                           (any status ≥ 400) simulates an API failure. No network call is made.
  */
-import type { Feedback, User } from "@shared/schema";
+import type { Feedback, FeedbackKind, User } from "@shared/schema";
 
 export const DEFAULT_ISSUES_REPO = "bridgewaterchevy/mmv";
+/** Labels for kind=problem (kept for callers that predate `kind`). */
 export const ISSUE_LABELS = ["user-report"];
+export const ISSUE_LABELS_BY_KIND: Record<FeedbackKind, string[]> = { problem: ["user-report"], suggestion: ["suggestion"] };
+export const ISSUE_TITLE_PREFIX: Record<FeedbackKind, string> = { problem: "[Report]", suggestion: "[Idea]" };
+export const ISSUE_HEADING: Record<FeedbackKind, string> = { problem: "What happened", suggestion: "The idea" };
+
+function kindOf(k: string | null | undefined): FeedbackKind {
+  return k === "suggestion" ? "suggestion" : "problem";
+}
+export function issueLabels(kind: FeedbackKind | string | null | undefined = "problem"): string[] {
+  return ISSUE_LABELS_BY_KIND[kindOf(kind)];
+}
 const API_TIMEOUT_MS = 15_000;
 
 export interface IssueConfig {
@@ -38,10 +53,10 @@ export function issueConfig(env: NodeJS.ProcessEnv = process.env): IssueConfig |
 
 export type Reporter = Pick<User, "id" | "name" | "handle">;
 
-export function issueTitle(message: string): string {
+export function issueTitle(message: string, kind: FeedbackKind | string | null | undefined = "problem"): string {
   const oneLine = message.replace(/\s+/g, " ").trim();
   const head = oneLine.slice(0, 60);
-  return `[Report] ${head}${oneLine.length > 60 ? "…" : ""}`;
+  return `${ISSUE_TITLE_PREFIX[kindOf(kind)]} ${head}${oneLine.length > 60 ? "…" : ""}`;
 }
 
 /** Absolute URL for the screenshot when it is publicly reachable (Supabase public bucket, or APP_URL + local path). */
@@ -58,8 +73,10 @@ const fence = (s: string) => "```\n" + s.replace(/```/g, "` ` `") + "\n```";
 export function issueBody(report: Feedback, reporter: Reporter | null, env: NodeJS.ProcessEnv = process.env): string {
   const shot = publicScreenshotUrl(report.screenshotPath, env);
   const createdAt = report.createdAt instanceof Date ? report.createdAt.toISOString() : String(report.createdAt ?? new Date().toISOString());
+  const kind = kindOf(report.kind);
+  const lastError = report.lastError?.trim() ?? "";
   const lines: string[] = [
-    "## What happened",
+    `## ${ISSUE_HEADING[kind]}`,
     "",
     report.message.trim(),
     "",
@@ -72,17 +89,17 @@ export function issueBody(report: Feedback, reporter: Reporter | null, env: Node
     `- **Timestamp:** ${createdAt}`,
     `- **Feedback id:** ${report.id}`,
     "",
-    "## Last error",
-    "",
-    report.lastError?.trim() ? fence(report.lastError.trim()) : "_none captured_",
-    "",
+  ];
+  // Problems always get a "Last error" section; suggestions only when something was actually captured.
+  if (kind === "problem" || lastError) lines.push("## Last error", "", lastError ? fence(lastError) : "_none captured_", "");
+  lines.push(
     "## Screenshot",
     "",
     shot ? `![screenshot](${shot})\n\n${shot}` : report.screenshotPath ? `_attached, not publicly reachable_ (\`${report.screenshotPath}\`)` : "_none_",
     "",
     "---",
-    "_Filed automatically by MMV “Report a problem”._",
-  ];
+    kind === "suggestion" ? "_Filed automatically by MMV “Suggest an idea”._" : "_Filed automatically by MMV “Report a problem”._",
+  );
   return lines.join("\n");
 }
 
@@ -140,11 +157,11 @@ function describe(r: GhResponse): string {
 export async function fileGithubIssue(report: Feedback, reporter: Reporter | null, env: NodeJS.ProcessEnv = process.env): Promise<IssueResult> {
   const cfg = issueConfig(env);
   if (!cfg) return { url: null, attempts: 0, withoutLabels: false, error: "not configured" };
-  const base = { title: issueTitle(report.message), body: issueBody(report, reporter, env) };
+  const base = { title: issueTitle(report.message, report.kind), body: issueBody(report, reporter, env) };
   try {
     let attempts = 1;
     let withoutLabels = false;
-    let r = await postIssue(cfg, { ...base, labels: ISSUE_LABELS }, env);
+    let r = await postIssue(cfg, { ...base, labels: issueLabels(report.kind) }, env);
     if (r.status >= 400 && r.status !== 401 && r.status !== 403) {
       console.warn(`[github] issue with labels failed (${describe(r)}); retrying without labels`);
       attempts = 2;

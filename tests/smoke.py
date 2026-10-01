@@ -15,8 +15,8 @@ What it does (end to end, with two throwaway users):
   -> upload synthetic JPEG as A (checks items/palette/analysisFailed, fetches photoPath)
   -> upload as B -> .txt upload rejected 400 -> lazy prices for A's pick (200 {items}; offers may be
      empty without SERPAPI_KEY/HASDATA_API_KEY) -> lock/unlock pick -> emoji + comment reactions
-  -> closet -> report a problem (POST /api/feedback 200 {id, githubIssueUrl}, missing message 400,
-     admin endpoints 403 for a normal user) -> wrong PIN 401 -> repeated wrong PINs 429 -> no-token 401
+  -> closet -> report a problem (POST /api/feedback 200 {id, kind, githubIssueUrl}, kind=suggestion 200,
+     bad kind 400, missing message 400, admin endpoints 403 for a normal user) -> wrong PIN 401 -> repeated wrong PINs 429 -> no-token 401
   -> delete picks (cleanup).
 
 Exit code 0 only if every check passes. Prints a PASS/FAIL table.
@@ -26,8 +26,9 @@ Notes:
     in an hour from one machine will fail at the signup step with 429.
   * The wrong-PIN test burns the 6-attempt/15-min login budget for the throwaway
     user B only; it never touches real accounts.
-  * The feedback step files ONE real GitHub issue per run when the server has GITHUB_ISSUES_TOKEN
-    configured (title "[Report] [smoke] …", label user-report). Close it or pass --no-feedback.
+  * The feedback step files TWO real GitHub issues per run when the server has GITHUB_ISSUES_TOKEN
+    configured (title "[Report] [smoke] …" label user-report, and "[Idea] [smoke] …" label suggestion).
+    Close them or pass --no-feedback.
 """
 import argparse
 import io
@@ -402,13 +403,25 @@ def run(base):
                 "message": "[smoke] automated test report - safe to close",
                 "page": "/smoke", "userAgent": "mmv-smoke/1.0", "appVersion": "smoke", "lastError": "none (smoke test)",
             }, timeout=60)
-            fb = expect("POST /api/feedback (JSON, no screenshot) -> 200 {id, githubIssueUrl}", r, 200, ["id", "githubIssueUrl"])
+            fb = expect("POST /api/feedback (JSON, no screenshot) -> 200 {id, kind, githubIssueUrl}", r, 200, ["id", "kind", "githubIssueUrl"])
             if fb:
                 check("feedback id is an integer", isinstance(fb["id"], int), repr(fb["id"]))
+                check("feedback kind defaults to 'problem'", fb.get("kind") == "problem", repr(fb.get("kind")))
                 gh = fb["githubIssueUrl"]
                 record("feedback githubIssueUrl is null or a github.com issue link", gh is None or (isinstance(gh, str) and gh.startswith("https://github.com/")),
                        "no GitHub filing configured (GITHUB_ISSUES_TOKEN unset) - report saved only" if gh is None else gh)
                 print(f"  >> FEEDBACK: saved #{fb['id']}" + (f", issue {gh}" if gh else " (no GitHub issue: token not configured or filing failed - see server logs '[github]')"))
+            r = api("POST", "/api/feedback", tok_a, json={
+                "message": "[smoke] automated test suggestion - safe to close", "kind": "suggestion",
+                "page": "/smoke", "userAgent": "mmv-smoke/1.0", "appVersion": "smoke",
+            }, timeout=60)
+            fs = expect("POST /api/feedback kind=suggestion -> 200 {id, kind, githubIssueUrl}", r, 200, ["id", "kind", "githubIssueUrl"])
+            if fs:
+                check("suggestion kind echoed back", fs.get("kind") == "suggestion", repr(fs.get("kind")))
+                ghs = fs["githubIssueUrl"]
+                print(f"  >> SUGGESTION: saved #{fs['id']}" + (f", issue {ghs}" if ghs else " (no GitHub issue)"))
+            r = api("POST", "/api/feedback", tok_a, json={"message": "bad kind", "kind": "complaint"})
+            expect("POST /api/feedback invalid kind -> 400", r, 400)
             r = api("POST", "/api/feedback", tok_a, json={"page": "/smoke"})
             expect("POST /api/feedback without message -> 400", r, 400)
             r = api("POST", "/api/feedback", tok_a, json={"message": "x" * 2001})

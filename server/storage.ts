@@ -23,6 +23,7 @@ import type {
   Feedback,
   FeedbackReport,
   FeedbackStatus,
+  FeedbackKind,
 } from "@shared/schema";
 import { and, eq, inArray, desc, asc, count, gte } from "drizzle-orm";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
@@ -332,9 +333,10 @@ export class DatabaseStorage {
     return row;
   }
 
-  // ----- feedback ("Report a problem") -----
+  // ----- feedback ("Report a problem" / "Suggest an idea") -----
   async createFeedback(data: {
     userId: number;
+    kind?: FeedbackKind;
     message: string;
     page?: string | null;
     userAgent?: string | null;
@@ -346,6 +348,7 @@ export class DatabaseStorage {
       .insert(feedback)
       .values({
         userId: data.userId,
+        kind: data.kind ?? "problem",
         message: data.message,
         page: data.page ?? null,
         userAgent: data.userAgent ?? null,
@@ -381,10 +384,15 @@ export class DatabaseStorage {
       .where(and(eq(feedback.userId, userId), gte(feedback.createdAt, since)));
     return Number(value);
   }
-  /** Newest first, capped. Reporter name/handle attached for the admin list. */
-  async listFeedback(limit = 100): Promise<FeedbackReport[]> {
+  /** Newest first, capped, optionally one kind only. Reporter name/handle attached for the admin list. */
+  async listFeedback(limit = 100, kind?: FeedbackKind): Promise<FeedbackReport[]> {
     const db = await getDb();
-    const rows = await db.select().from(feedback).orderBy(desc(feedback.createdAt), desc(feedback.id)).limit(limit);
+    const rows = await db
+      .select()
+      .from(feedback)
+      .where(kind ? eq(feedback.kind, kind) : undefined)
+      .orderBy(desc(feedback.createdAt), desc(feedback.id))
+      .limit(limit);
     if (rows.length === 0) return [];
     const ids = Array.from(new Set(rows.map((r) => r.userId)));
     const people = await db.select({ id: users.id, name: users.name, handle: users.handle }).from(users).where(inArray(users.id, ids));

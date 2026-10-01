@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
-import { CheckCircle2, ExternalLink, ImagePlus, Loader2, LifeBuoy, ShieldCheck, X } from "lucide-react";
+import { CheckCircle2, ExternalLink, ImagePlus, Lightbulb, Loader2, LifeBuoy, ShieldCheck, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 import { apiJson, errorStatus } from "@/lib/queryClient";
@@ -11,23 +11,82 @@ import { Textarea } from "@/components/ui/textarea";
 import { Drawer, DrawerContent, DrawerDescription, DrawerHeader, DrawerTitle } from "@/components/ui/drawer";
 
 // ---------- open/close bus ----------
-// The sheet is mounted once (ReportProblemHost in App). Any button anywhere calls openReportProblem().
+// The sheet is mounted once (ReportProblemHost in App). Any button anywhere calls openReportProblem()
+// or openSuggestion(); both route through openFeedback(kind).
 const OPEN_EVENT = "mmv:report-problem";
 
-export function openReportProblem(): void {
-  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(OPEN_EVENT));
+/** Mirrors the server's `kind` field on POST /api/feedback (default "problem"). */
+export type FeedbackKind = "problem" | "suggestion";
+
+function isFeedbackKind(v: unknown): v is FeedbackKind {
+  return v === "problem" || v === "suggestion";
 }
 
-/** Mount once near the app root; listens for openReportProblem() and renders the sheet. */
+export function openFeedback(kind: FeedbackKind = "problem"): void {
+  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent<{ kind: FeedbackKind }>(OPEN_EVENT, { detail: { kind } }));
+}
+
+export function openReportProblem(): void {
+  openFeedback("problem");
+}
+
+export function openSuggestion(): void {
+  openFeedback("suggestion");
+}
+
+/** Mount once near the app root; listens for openFeedback(kind) and renders the sheet. */
 export function ReportProblemHost() {
   const [open, setOpen] = useState(false);
+  const [kind, setKind] = useState<FeedbackKind>("problem");
   useEffect(() => {
-    const on = () => setOpen(true);
+    const on = (e: Event) => {
+      const detail = (e as CustomEvent<{ kind?: unknown }>).detail;
+      setKind(isFeedbackKind(detail?.kind) ? detail.kind : "problem");
+      setOpen(true);
+    };
     window.addEventListener(OPEN_EVENT, on);
     return () => window.removeEventListener(OPEN_EVENT, on);
   }, []);
-  return <ReportProblemDrawer open={open} onOpenChange={setOpen} />;
+  return <ReportProblemDrawer open={open} onOpenChange={setOpen} kind={kind} />;
 }
+
+// ---------- copy per kind ----------
+interface FeedbackCopy {
+  title: string;
+  subtitle: string;
+  messageLabel: string;
+  placeholder: string;
+  attachTitle: string;
+  attachHint: string;
+  context: string;
+  successTitle: string;
+  successBody: string;
+}
+
+const COPY: Record<FeedbackKind, FeedbackCopy> = {
+  problem: {
+    title: "Report a problem",
+    subtitle: "Something broken or confusing? Tell us and we'll fix it.",
+    messageLabel: "What happened?",
+    placeholder: "e.g. I tapped Lock on my pick and the spinner never stopped.",
+    attachTitle: "Add a screenshot",
+    attachHint: "Optional · pick one from Photos",
+    context: "We'll include: page, device, app version, and the last error — no photos of your picks.",
+    successTitle: "Thanks — we got it",
+    successBody: "We read every one.",
+  },
+  suggestion: {
+    title: "Suggest an idea",
+    subtitle: "What would make MMV better for your crew?",
+    messageLabel: "Your idea",
+    placeholder: "e.g. Let me pick photos from my camera roll",
+    attachTitle: "Add a screenshot or mockup",
+    attachHint: "Optional · pick one from Photos",
+    context: "We'll include: page, device, and app version.",
+    successTitle: "Thanks — idea logged",
+    successBody: "We read every one.",
+  },
+};
 
 // ---------- context ----------
 const MAX_MESSAGE = 2000;
@@ -57,8 +116,10 @@ function formatBytes(n: number): string {
 }
 
 // ---------- the sheet ----------
-export function ReportProblemDrawer({ open, onOpenChange }: { open: boolean; onOpenChange: (o: boolean) => void }) {
+export function ReportProblemDrawer({ open, onOpenChange, kind = "problem" }: { open: boolean; onOpenChange: (o: boolean) => void; kind?: FeedbackKind }) {
   const { toast } = useToast();
+  const copy = COPY[kind];
+  const Icon = kind === "suggestion" ? Lightbulb : LifeBuoy;
   const [message, setMessage] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
@@ -116,11 +177,13 @@ export function ReportProblemDrawer({ open, onOpenChange }: { open: boolean; onO
     try {
       const ctx = captureContext();
       const form = new FormData();
+      form.append("kind", kind);
       form.append("message", text.slice(0, MAX_MESSAGE));
       form.append("page", ctx.page);
       form.append("userAgent", ctx.userAgent);
       form.append("appVersion", ctx.appVersion);
-      form.append("lastError", ctx.lastError);
+      // Ideas aren't tied to a failure, so the last console/API error stays out of the body.
+      if (kind === "problem") form.append("lastError", ctx.lastError);
       if (file) form.append("screenshot", file, file.name || "screenshot.png");
       const res = await apiJson<FeedbackResponse>("POST", "/api/feedback", form);
       setDone(res && typeof res === "object" ? res : { id: "" });
@@ -138,21 +201,21 @@ export function ReportProblemDrawer({ open, onOpenChange }: { open: boolean; onO
 
   return (
     <Drawer open={open} onOpenChange={onOpenChange}>
-      <DrawerContent className="mx-auto max-h-[92dvh] max-w-md" data-testid="sheet-report-problem">
+      <DrawerContent className="mx-auto max-h-[92dvh] max-w-md" data-testid="sheet-report-problem" data-kind={kind}>
         <div className="overflow-y-auto px-4 pb-[calc(env(safe-area-inset-bottom,0px)+1.5rem)]">
           {done ? (
             <div className="flex flex-col items-center px-2 pb-2 pt-6 text-center" data-testid="state-report-success">
               <span className="mb-3 flex h-14 w-14 items-center justify-center rounded-full bg-accent text-accent-foreground">
                 <CheckCircle2 className="h-7 w-7" strokeWidth={2.2} />
               </span>
-              <DrawerTitle className="font-display text-xl">Thanks — we got it</DrawerTitle>
+              <DrawerTitle className="font-display text-xl">{copy.successTitle}</DrawerTitle>
               <DrawerDescription className="mt-1.5">
                 {done.id ? (
                   <>
-                    Report <span className="font-mono font-semibold text-foreground" data-testid="text-report-id">#{String(done.id)}</span>. We read every one.
+                    Report <span className="font-mono font-semibold text-foreground" data-testid="text-report-id">#{String(done.id)}</span>. {copy.successBody}
                   </>
                 ) : (
-                  "We read every one."
+                  copy.successBody
                 )}
               </DrawerDescription>
               {done.githubIssueUrl && (
@@ -174,16 +237,16 @@ export function ReportProblemDrawer({ open, onOpenChange }: { open: boolean; onO
             <form onSubmit={submit} noValidate>
               <DrawerHeader className="px-0 text-left">
                 <DrawerTitle className="flex items-center gap-2 font-display text-xl">
-                  <LifeBuoy className="h-5 w-5 text-primary" aria-hidden /> Report a problem
+                  <Icon className="h-5 w-5 text-primary" aria-hidden /> {copy.title}
                 </DrawerTitle>
-                <DrawerDescription>Something broken or confusing? Tell us and we'll fix it.</DrawerDescription>
+                <DrawerDescription>{copy.subtitle}</DrawerDescription>
               </DrawerHeader>
 
               <div className="space-y-4">
                 <div>
                   <div className="mb-1.5 flex items-baseline justify-between">
                     <Label htmlFor="report-message" className="text-sm font-semibold">
-                      What happened?
+                      {copy.messageLabel}
                     </Label>
                     <span className={cn("text-[11px] tabular-nums", message.length > MAX_MESSAGE - 100 ? "text-destructive" : "text-muted-foreground")} aria-live="polite">
                       {message.length}/{MAX_MESSAGE}
@@ -193,7 +256,7 @@ export function ReportProblemDrawer({ open, onOpenChange }: { open: boolean; onO
                     id="report-message"
                     value={message}
                     onChange={(e) => setMessage(e.target.value.slice(0, MAX_MESSAGE))}
-                    placeholder="e.g. I tapped Lock on my pick and the spinner never stopped."
+                    placeholder={copy.placeholder}
                     rows={4}
                     maxLength={MAX_MESSAGE}
                     required
@@ -245,8 +308,8 @@ export function ReportProblemDrawer({ open, onOpenChange }: { open: boolean; onO
                         <ImagePlus className="h-5 w-5" strokeWidth={1.8} />
                       </span>
                       <span className="min-w-0">
-                        <span className="block text-sm font-medium">Add a screenshot</span>
-                        <span className="block text-xs text-muted-foreground">Optional · pick one from Photos</span>
+                        <span className="block text-sm font-medium">{copy.attachTitle}</span>
+                        <span className="block text-xs text-muted-foreground">{copy.attachHint}</span>
                       </span>
                     </button>
                   )}
@@ -254,7 +317,7 @@ export function ReportProblemDrawer({ open, onOpenChange }: { open: boolean; onO
 
                 <p className="flex items-start gap-2 text-xs leading-snug text-muted-foreground" data-testid="text-report-context">
                   <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
-                  <span>We'll include: page, device, app version, and the last error — no photos of your picks.</span>
+                  <span>{copy.context}</span>
                 </p>
 
                 {error && (

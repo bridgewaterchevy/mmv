@@ -135,10 +135,12 @@ const DDL = [
     day TEXT PRIMARY KEY,
     calls INTEGER NOT NULL DEFAULT 0
   )`,
-  // "Report a problem" (server/feedback.ts). github_issue_url is filled when GITHUB_ISSUES_TOKEN is configured.
+  // "Report a problem" / "Suggest an idea" (server/feedback.ts). kind is 'problem' | 'suggestion';
+  // github_issue_url is filled when GITHUB_ISSUES_TOKEN is configured.
   `CREATE TABLE IF NOT EXISTS feedback (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'problem',
     message TEXT NOT NULL,
     page TEXT,
     user_agent TEXT,
@@ -149,6 +151,7 @@ const DDL = [
     status TEXT NOT NULL DEFAULT 'open',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )`,
+  `ALTER TABLE feedback ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'problem'`,
   `CREATE INDEX IF NOT EXISTS feedback_created_idx ON feedback (created_at DESC)`,
   `CREATE INDEX IF NOT EXISTS feedback_user_idx ON feedback (user_id)`,
 ];

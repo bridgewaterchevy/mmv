@@ -4,8 +4,9 @@
  * Exercises server/github.ts (title/body rendering, label retry, failure handling, canned-response hook)
  * in ONE process and prints a single JSON document for the Python test to assert on. The mock GitHub
  * server decides the behaviour from the repo name (mock/ok, mock/labelfail, mock/fail, mock/auth).
+ * Also covers kind=suggestion ("[Idea]" title, "suggestion" label, "The idea" heading, no "Last error").
  */
-import { fileGithubIssue, issueTitle, issueBody, issueConfig, publicScreenshotUrl, DEFAULT_ISSUES_REPO, ISSUE_LABELS } from "../server/github";
+import { fileGithubIssue, issueTitle, issueBody, issueConfig, publicScreenshotUrl, issueLabels, DEFAULT_ISSUES_REPO, ISSUE_LABELS, ISSUE_LABELS_BY_KIND } from "../server/github";
 import { adminHandles, isAdmin } from "../server/feedback";
 import type { Feedback } from "../shared/schema";
 
@@ -14,6 +15,7 @@ const out: Record<string, unknown> = {};
 const report: Feedback = {
   id: 42,
   userId: 7,
+  kind: "problem",
   message: "The upload button does nothing on iOS Safari when I pick a HEIC photo.\n\nTried twice.",
   page: "/crews/3/day/2026-10-01",
   userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Safari/605.1",
@@ -25,6 +27,14 @@ const report: Feedback = {
   createdAt: new Date("2026-10-01T21:36:00.000Z"),
 };
 const reporter = { id: 7, name: "Jane Doe", handle: "janed" };
+const idea: Feedback = {
+  ...report,
+  id: 43,
+  kind: "suggestion",
+  message: "Let me reorder my closet by colour.\n\nWould make mornings faster.",
+  lastError: null,
+  screenshotPath: null,
+};
 
 async function main() {
   const env = (overrides: Record<string, string | undefined>): NodeJS.ProcessEnv => {
@@ -38,7 +48,20 @@ async function main() {
     long: issueTitle("x".repeat(100)),
     short: issueTitle("  Button   broken\non load "),
     exact60: issueTitle("a".repeat(60)),
+    explicitProblem: issueTitle("Button broken", "problem"),
+    idea: issueTitle("  Sort closet\nby colour ", "suggestion"),
+    ideaLong: issueTitle("y".repeat(100), "suggestion"),
+    unknownKind: issueTitle("Button broken", "whatever"),
   };
+  out.labels = {
+    byKind: ISSUE_LABELS_BY_KIND,
+    problem: issueLabels("problem"),
+    suggestion: issueLabels("suggestion"),
+    defaulted: issueLabels(),
+    unknown: issueLabels("nope"),
+  };
+  out.ideaBody = issueBody(idea, reporter);
+  out.ideaBodyWithError = issueBody({ ...idea, lastError: "Error: boom" }, reporter);
   out.body = issueBody(report, reporter);
   out.bodyNoReporter = issueBody({ ...report, lastError: null, screenshotPath: null, page: null }, null);
   out.bodyLocalShotNoAppUrl = issueBody({ ...report, screenshotPath: "/uploads/feedback/42.png" }, reporter, env({ APP_URL: undefined }));
@@ -62,6 +85,7 @@ async function main() {
 
   // ---- against the mock server
   out.ok = await fileGithubIssue(report, reporter, env({ GITHUB_ISSUES_REPO: "mock/ok" }));
+  out.okIdea = await fileGithubIssue(idea, reporter, env({ GITHUB_ISSUES_REPO: "mock/ok" }));
   out.labelRetry = await fileGithubIssue(report, reporter, env({ GITHUB_ISSUES_REPO: "mock/labelfail" }));
   out.fail = await fileGithubIssue(report, reporter, env({ GITHUB_ISSUES_REPO: "mock/fail" }));
   out.auth = await fileGithubIssue(report, reporter, env({ GITHUB_ISSUES_REPO: "mock/auth" }));

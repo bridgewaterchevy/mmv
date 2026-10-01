@@ -56,9 +56,9 @@ Photos live in **Storage → outfits** bucket and are *not* part of a database d
 3. GitHub → **Actions** → **keep-alive**: if runs are failing, the `APP_URL` variable is wrong; if the workflow is disabled (public repos after 60 days of no commits), click **Enable workflow** ([GitHub Docs](https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule)).
 4. Render suspended the service for the month → free instance hours (750/month) are exhausted; it resumes on the 1st ([Render](https://render.com/docs/free)).
 
-## "Report a problem" (user feedback → GitHub issues)
+## "Report a problem" / "Suggest an idea" (user feedback → GitHub issues)
 
-Signed-in users can send a report (message, page, device, last error, optional screenshot). Every report is saved in the `feedback` table first; if GitHub filing is configured, an issue is opened as well and its URL is stored on the row. A GitHub outage never blocks a report — it just logs `[github] could not file issue …` in Render **Logs**.
+Signed-in users can send a report (message, page, device, last error, optional screenshot). Each one has a `kind`: `problem` (default, a bug report) or `suggestion` (an idea). Every report is saved in the `feedback` table first; if GitHub filing is configured, an issue is opened as well and its URL is stored on the row. A GitHub outage never blocks a report — it just logs `[github] could not file issue …` in Render **Logs**.
 
 ### Set up the GitHub token (one time)
 
@@ -67,9 +67,16 @@ Signed-in users can send a report (message, page, device, last error, optional s
 3. **Repository permissions** → **Issues: Read and write**. Leave every other permission at *No access*. (Issues write implicitly grants *Metadata: Read-only*; that is expected.)
 4. **Generate token**, copy the `github_pat_…` value once.
 5. Render → **mmv** → **Environment** → set `GITHUB_ISSUES_TOKEN` to the token and `GITHUB_ISSUES_REPO` to `bridgewaterchevy/mmv` → **Save** (Render redeploys). The token is only ever sent as `Authorization: Bearer` to `api.github.com`; it is never logged.
-6. Optional: create the `user-report` label in the repo (**Issues** → **Labels**). If the label cannot be applied, the server retries without labels, so this is cosmetic.
+6. Optional: create the `user-report` and `suggestion` labels in the repo (**Issues** → **Labels**). If a label cannot be applied, the server retries without labels, so this is cosmetic.
 
-Issues are titled `[Report] <first 60 chars of the message>` and carry the message, reporter (name, @handle, user id), page, device/user agent, app version, last error (code block), screenshot link (when publicly reachable — Supabase bucket URLs always are; set `APP_URL` so local `/uploads/...` paths become absolute too) and timestamp.
+Issues carry the message, reporter (name, @handle, user id), page, device/user agent, app version, screenshot link (when publicly reachable — Supabase bucket URLs always are; set `APP_URL` so local `/uploads/...` paths become absolute too) and timestamp. Per kind:
+
+| kind | Title | Label | First heading | "Last error" section |
+| --- | --- | --- | --- | --- |
+| `problem` | `[Report] <first 60 chars>` | `user-report` | What happened | always (code block or `_none captured_`) |
+| `suggestion` | `[Idea] <first 60 chars>` | `suggestion` | The idea | only when a client error was captured |
+
+Filter in GitHub with `label:user-report` or `label:suggestion`.
 
 ### Admins (who can read and resolve reports)
 
@@ -77,14 +84,15 @@ Set `ADMIN_HANDLES` on Render to a comma-separated list of **app handles** (the 
 
 | Endpoint | Who | What |
 | --- | --- | --- |
-| `POST /api/feedback` | any signed-in user | JSON `{ message, page?, userAgent?, appVersion?, lastError? }` or multipart with the same fields plus an optional `screenshot` image (≤ 5 MB). Returns `{ id, githubIssueUrl \| null }`. Limits: 5/hour per user, 20/hour per IP (429). |
-| `GET /api/feedback` | admin | Latest 100 reports, newest first, each with `user: { id, name, handle }`, `status`, `githubIssueUrl`, `screenshotPath`. Non-admins get 403. |
+| `POST /api/feedback` | any signed-in user | JSON `{ kind?, message, page?, userAgent?, appVersion?, lastError? }` or multipart with the same fields plus an optional `screenshot` image (≤ 5 MB). `kind` is `"problem"` (default) or `"suggestion"`; anything else is 400. Returns `{ id, kind, githubIssueUrl \| null }`. Limits are shared across kinds: 5/hour per user, 20/hour per IP (429). |
+| `GET /api/feedback` | admin | Latest 100 reports, newest first, each with `kind`, `user: { id, name, handle }`, `status`, `githubIssueUrl`, `screenshotPath`. Optional `?kind=problem` / `?kind=suggestion` filter (other values 400). Non-admins get 403. |
 | `PATCH /api/feedback/:id` | admin | Body `{ "status": "open" \| "resolved" }`. Returns the updated report. |
 
 Quick check from a terminal (replace the token with the value the app stores in `localStorage` after login, header `x-auth-token`):
 
 ```bash
 curl -H "x-auth-token: $TOKEN" https://<app>/api/feedback | jq '.[0]'
+curl -H "x-auth-token: $TOKEN" "https://<app>/api/feedback?kind=suggestion" | jq 'map(.message)'
 curl -X PATCH -H "x-auth-token: $TOKEN" -H "content-type: application/json" -d '{"status":"resolved"}' https://<app>/api/feedback/12
 ```
 
@@ -94,6 +102,7 @@ Screenshots live in the same Supabase bucket as outfit photos under `feedback/<i
 
 - Render **Logs** → search `[github]`. `HTTP 401 Bad credentials` = token expired or revoked → generate a new one and update `GITHUB_ISSUES_TOKEN`. `HTTP 404 Not Found` = token has no access to `GITHUB_ISSUES_REPO` (wrong repo in *Repository access*, or the Issues permission is missing). `HTTP 403 … rate limit` = wait an hour.
 - Reports are still in the database either way: Supabase → **Table Editor** → `feedback` (or `GET /api/feedback` as an admin).
+- Existing deployments get the `kind` column automatically at boot (`ALTER TABLE feedback ADD COLUMN IF NOT EXISTS kind … DEFAULT 'problem'`); older rows read as `problem`.
 
 ## Rotate a secret
 

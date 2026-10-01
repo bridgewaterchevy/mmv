@@ -4,7 +4,7 @@ import type { ReactNode } from "react";
 import type { PublicUser } from "@shared/schema";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/lib/auth";
-import { openReportProblem } from "@/components/report-problem";
+import { openReportProblem, openSuggestion } from "@/components/report-problem";
 
 export const APP_NAME = "MMV";
 export const APP_TAGLINE = "Match My Vibe";
@@ -125,14 +125,23 @@ function TabBar() {
           Sign out
         </button>
       </div>
-      <div className="-mt-1 flex justify-center pb-1">
+      <div className="-mt-1 flex items-center justify-center pb-1 text-[11px] text-muted-foreground">
         <button
           type="button"
           onClick={openReportProblem}
-          className="rounded-md px-2 py-0.5 text-[11px] text-muted-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="rounded-md px-2 py-0.5 underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           data-testid="link-report-problem"
         >
           Report a problem
+        </button>
+        <span aria-hidden className="select-none">·</span>
+        <button
+          type="button"
+          onClick={openSuggestion}
+          className="rounded-md px-2 py-0.5 underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          data-testid="link-suggest-idea"
+        >
+          Suggest an idea
         </button>
       </div>
     </nav>
