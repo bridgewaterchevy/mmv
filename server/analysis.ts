@@ -1,29 +1,32 @@
 /**
- * Background outfit analysis.
+ * Background outfit analysis, one job per PHOTO.
  *
- * POST /api/sessions/:id/picks stores the photo and answers immediately with analysisStatus "pending";
- * the Gemini call (20-40 s on a cold free tier) runs here afterwards. A small in-process queue keeps at
- * most VISION_CONCURRENCY (default 2) Gemini requests in flight so a burst of uploads does not hammer the
- * API, and jobs are deduped per pick id.
+ * POST /api/sessions/:id/picks (1..N photos) and POST /api/picks/:id/photos store the files and answer immediately
+ * with analysisStatus "pending"; the Gemini calls (20-40 s each on a cold free tier) run here afterwards. A small
+ * in-process queue keeps at most VISION_CONCURRENCY (default 2) Gemini requests in flight so a burst of uploads
+ * does not hammer the API, and jobs are deduped per photo id.
  *
  * Correctness notes
- *  - Re-posting replaces the photo on the SAME pick row (storage.upsertPick). Every job therefore carries
- *    the photoPath it was started for and storage.completeAnalysis/failAnalysis only write when the row
- *    still has that photo, so a slow analysis of an old photo can never overwrite a newer one.
- *  - If a job for a pick is already running when another is requested (e.g. the owner re-posted), the new
- *    request is parked and started once the running one finishes (it reloads the row, so it sees the new photo).
- *  - The queue is in-memory: a restart loses it. recoverStuckAnalyses() re-queues rows still "pending"
- *    after START_RECOVERY_AGE_MS at boot, and a periodic sweep catches anything else that slipped through.
+ *  - Every job carries the `photoPath` it was started for and storage.completePhotoAnalysis/failPhotoAnalysis only
+ *    write when the pick_photos row still has that path, so a slow analysis can never land on a replaced photo.
+ *    (Re-posting a pick deletes its photo rows, so stale jobs simply find no row.)
+ *  - Finishing a photo recomputes the pick aggregates (items/palette/status) in the same transaction.
+ *  - If a job for a photo is already running when another is requested, the new request is parked and started once
+ *    the running one finishes (it reloads the row, so it sees the current state).
+ *  - The queue is in-memory: a restart loses it. recoverStuckAnalyses() re-queues photo rows still "pending" after
+ *    START_RECOVERY_AGE_MS at boot, and a periodic sweep catches anything else that slipped through.
  *  - Errors stored on the row are short and scrubbed (no URLs with query strings, no key/token-looking text).
  */
 import { storage } from "./storage";
 import { files } from "./files";
 import { analyzeOutfit } from "./vision";
-import type { Pick } from "@shared/schema";
+import type { PickPhoto } from "@shared/schema";
 
 export interface AnalysisJob {
+  /** pick_photos.id — the queue key. */
+  photoId: number;
   pickId: number;
-  /** Photo the job was created for; results are dropped if the row has moved on to another photo. */
+  /** Photo path the job was created for; results are dropped if the row has moved on. */
   photoPath: string;
   /** Upload bytes when we still have them (fresh upload); otherwise the photo is loaded from the file store. */
   buffer?: Buffer;
@@ -35,29 +38,29 @@ export interface AnalysisJob {
 const CONCURRENCY = Math.max(1, Number(process.env.VISION_CONCURRENCY || 2) || 2);
 /** Hard cap on one Gemini round-trip (the client stops polling at ~90 s). */
 const JOB_TIMEOUT_MS = Math.max(10_000, Number(process.env.VISION_TIMEOUT_MS || 120_000) || 120_000);
-/** Boot recovery: pending picks created before this long ago are re-queued. */
+/** Boot recovery: pending photos created before this long ago are re-queued. */
 export const START_RECOVERY_AGE_MS = Math.max(0, Number(process.env.VISION_RECOVERY_AGE_MS ?? 2 * 60 * 1000) || 0);
-/** Periodic sweep for pending picks nobody is working on (safety net; cheap indexed query). */
+/** Periodic sweep for pending photos nobody is working on (safety net; cheap indexed query). */
 const SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 const SWEEP_AGE_MS = 10 * 60 * 1000;
 
-const queued = new Map<number, AnalysisJob>(); // waiting, in insertion order
+const queued = new Map<number, AnalysisJob>(); // waiting, in insertion order (key: photo id)
 const running = new Set<number>();
-const parked = new Map<number, AnalysisJob>(); // requested while the same pick was running
+const parked = new Map<number, AnalysisJob>(); // requested while the same photo was running
 let stats = { started: 0, ready: 0, failed: 0, dropped: 0 };
 
 export function enqueueAnalysis(job: AnalysisJob): void {
-  if (running.has(job.pickId)) {
-    parked.set(job.pickId, job);
+  if (running.has(job.photoId)) {
+    parked.set(job.photoId, job);
     return;
   }
-  // Dedupe: a newer request for the same pick replaces the waiting one (it would reload the row anyway).
-  queued.set(job.pickId, job);
+  // Dedupe: a newer request for the same photo replaces the waiting one (it would reload the row anyway).
+  queued.set(job.photoId, job);
   pump();
 }
 
-export function isAnalysisQueued(pickId: number): boolean {
-  return queued.has(pickId) || running.has(pickId) || parked.has(pickId);
+export function isAnalysisQueued(photoId: number): boolean {
+  return queued.has(photoId) || running.has(photoId) || parked.has(photoId);
 }
 
 /** For logs/tests. */
@@ -67,18 +70,18 @@ export function analysisQueueStats() {
 
 function pump() {
   while (running.size < CONCURRENCY && queued.size > 0) {
-    const [pickId, job] = queued.entries().next().value as [number, AnalysisJob];
-    queued.delete(pickId);
-    running.add(pickId);
+    const [photoId, job] = queued.entries().next().value as [number, AnalysisJob];
+    queued.delete(photoId);
+    running.add(photoId);
     stats.started++;
     void runJob(job)
-      .catch((err) => console.error(`[analysis] pick ${pickId} job crashed`, err))
+      .catch((err) => console.error(`[analysis] photo ${photoId} job crashed`, err))
       .finally(() => {
-        running.delete(pickId);
-        const next = parked.get(pickId);
+        running.delete(photoId);
+        const next = parked.get(photoId);
         if (next) {
-          parked.delete(pickId);
-          queued.set(pickId, next);
+          parked.delete(photoId);
+          queued.set(photoId, next);
         }
         pump();
       });
@@ -87,17 +90,18 @@ function pump() {
 
 async function runJob(job: AnalysisJob): Promise<void> {
   const t0 = Date.now();
-  const pick = await storage.getPick(job.pickId);
-  if (!pick) {
+  const photo = await storage.getPhoto(job.photoId);
+  const tag = `pick ${job.pickId} photo ${job.photoId}`;
+  if (!photo) {
     stats.dropped++;
-    return; // deleted meanwhile
+    return; // deleted meanwhile (photo removed or pick re-posted)
   }
-  if (pick.photoPath !== job.photoPath) {
+  if (photo.path !== job.photoPath) {
     stats.dropped++;
-    console.log(`[analysis] pick ${job.pickId}: photo changed before analysis started; skipping stale job (${job.reason})`);
+    console.log(`[analysis] ${tag}: path changed before analysis started; skipping stale job (${job.reason})`);
     return;
   }
-  if (pick.analysisStatus !== "pending") {
+  if (photo.analysisStatus !== "pending") {
     // Someone (another instance?) already finished it. Only the explicit retry path re-marks pending first.
     stats.dropped++;
     return;
@@ -106,32 +110,31 @@ async function runJob(job: AnalysisJob): Promise<void> {
     let buffer = job.buffer;
     let mime = job.mime;
     if (!buffer) {
-      const loaded = await files.read(pick.photoPath);
+      const loaded = await files.read(photo.path);
       buffer = loaded.buffer;
       mime = loaded.mime;
     }
     buffer = await downscaleForVision(buffer);
     const analysis = await withTimeout(analyzeOutfit(buffer, mime || "image/jpeg"), JOB_TIMEOUT_MS, "Analysis timed out");
-    const updated = await storage.completeAnalysis(pick.id, pick.photoPath, {
+    const updated = await storage.completePhotoAnalysis(photo.id, photo.path, {
       palette: analysis.palette,
       items: analysis.items,
-      // Keep the owner's own note; fall back to the model's one-line summary when they left it blank.
-      note: pick.note || analysis.summary || null,
+      summary: analysis.summary || null,
     });
     if (updated) stats.ready++;
     else stats.dropped++;
     console.log(
-      `[analysis] pick ${pick.id} ${updated ? "ready" : "stale (photo replaced)"}: ${analysis.items.length} item(s) in ${Date.now() - t0}ms (${job.reason})`,
+      `[analysis] ${tag} ${updated ? "ready" : "stale (photo replaced)"}: ${analysis.items.length} item(s) in ${Date.now() - t0}ms (${job.reason})`,
     );
   } catch (err) {
     const short = shortError(err);
-    const updated = await storage.failAnalysis(pick.id, pick.photoPath, short).catch((e) => {
-      console.error(`[analysis] pick ${pick.id}: could not record failure`, e);
+    const updated = await storage.failPhotoAnalysis(photo.id, photo.path, short).catch((e: unknown) => {
+      console.error(`[analysis] ${tag}: could not record failure`, e);
       return undefined;
     });
     if (updated) stats.failed++;
     else stats.dropped++;
-    console.error(`[analysis] pick ${pick.id} failed after ${Date.now() - t0}ms (${job.reason}): ${short}`);
+    console.error(`[analysis] ${tag} failed after ${Date.now() - t0}ms (${job.reason}): ${short}`);
   }
 }
 
@@ -205,18 +208,18 @@ export function shortError(err: unknown): string {
 }
 
 /**
- * Boot recovery: picks still "pending" after START_RECOVERY_AGE_MS have no job in this (fresh) process, so
+ * Boot recovery: photos still "pending" after START_RECOVERY_AGE_MS have no job in this (fresh) process, so
  * re-queue them. Returns the count (also logged). Call once routes are registered and the file store is ready.
  */
 export async function recoverStuckAnalyses(ageMs = START_RECOVERY_AGE_MS, reason: AnalysisJob["reason"] = "recovery"): Promise<number> {
-  const rows: Pick[] = await storage.stalePendingPicks(new Date(Date.now() - ageMs));
+  const rows: PickPhoto[] = await storage.stalePendingPhotos(new Date(Date.now() - ageMs));
   let n = 0;
-  for (const p of rows) {
-    if (isAnalysisQueued(p.id)) continue;
-    enqueueAnalysis({ pickId: p.id, photoPath: p.photoPath, reason });
+  for (const ph of rows) {
+    if (isAnalysisQueued(ph.id)) continue;
+    enqueueAnalysis({ photoId: ph.id, pickId: ph.pickId, photoPath: ph.path, reason });
     n++;
   }
-  if (reason === "recovery" || n > 0) console.log(`[analysis] ${reason}: re-queued ${n} pending pick(s) older than ${Math.round(ageMs / 1000)}s`);
+  if (reason === "recovery" || n > 0) console.log(`[analysis] ${reason}: re-queued ${n} pending photo(s) older than ${Math.round(ageMs / 1000)}s`);
   return n;
 }
 

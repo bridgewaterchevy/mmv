@@ -11,6 +11,8 @@ the 6-attempt login limiter and the upsert-one-pick-per-user behaviour, plus the
 analysis contract: POST picks -> 201 with analysisStatus "pending"; the first GET /api/picks/:id
 afterwards flips it to "failed" (no Gemini here: analysisError set, analysisFailed=true, items []).
 POST /api/picks/:id/analyze (owner only, 403 otherwise) re-queues the same way.
+Multi-photo picks: 1..6 files under `photo` -> photos[] (position order); pick-level status/items are aggregates;
+POST /api/picks/:id/photos, DELETE /api/picks/:id/photos/:photoId (last -> 400), POST .../photos/:photoId/analyze.
 """
 import json
 import re
@@ -23,7 +25,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SHOP_FOR = ("womens", "mens", "unisex")
 DB = {"users": {}, "tokens": {}, "crews": {}, "sessions": {}, "picks": {}, "reactions": [], "files": {}}
-SEQ = {"u": 0, "c": 0, "s": 0, "p": 0}
+SEQ = {"u": 0, "c": 0, "s": 0, "p": 0, "ph": 0}
+MAX_PHOTOS = 6
 LOGIN_ATTEMPTS = {}
 
 
@@ -36,21 +39,72 @@ def pub(u):
     return {k: v for k, v in u.items() if k not in ("pin", "token")}
 
 
+def new_photo(path, position):
+    return {"id": nid("ph"), "path": path, "position": position, "analysisStatus": "pending", "analysisError": None, "items": [], "palette": [], "analyzedAt": None}
+
+
+def aggregate(p):
+    """Mirror server/aggregate.ts: status pending > ready > failed; error = first failed when none ready; cover = photo 0."""
+    photos = sorted(p["photos"], key=lambda x: x["position"])
+    st = [x["analysisStatus"] for x in photos]
+    p["analysisStatus"] = "pending" if "pending" in st else "ready" if "ready" in st else "failed"
+    failed = next((x for x in photos if x["analysisStatus"] == "failed"), None)
+    p["analysisError"] = failed["analysisError"] if (failed and "ready" not in st) else None
+    p["items"] = [i for x in photos for i in x["items"]][:12]
+    p["palette"] = list(dict.fromkeys(h for x in photos for h in x["palette"]))[:6]
+    p["analyzedAt"] = max([x["analyzedAt"] for x in photos if x["analyzedAt"]] or [None])
+    p["photoPath"] = photos[0]["path"] if photos else p.get("photoPath")
+    return p
+
+
 def pick_view(p):
-    v = dict(p)
+    aggregate(p)
+    v = {k: val for k, val in p.items() if k != "photos"}
     v["analysisFailed"] = p.get("analysisStatus") == "failed"
     v["user"] = pub(DB["users"][p["userId"]])
     v["reactions"] = [dict(r, user=pub(DB["users"][r["userId"]])) for r in DB["reactions"] if r["pickId"] == p["id"]]
+    v["photos"] = [{"id": x["id"], "url": x["path"], "position": x["position"], "analysisStatus": x["analysisStatus"],
+                    "analysisError": x["analysisError"], "itemCount": len(x["items"])} for x in sorted(p["photos"], key=lambda x: x["position"])]
     return v
 
 
 def settle_analysis(p):
-    """Simulate the background job finishing: the mock has no vision, so pending -> failed."""
-    if p.get("analysisStatus") == "pending":
-        p["analysisStatus"] = "failed"
-        p["analysisError"] = "vision unavailable in mock_api"
-        p["analyzedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Simulate the background jobs finishing: the mock has no vision, so every pending photo -> failed."""
+    for ph in p["photos"]:
+        if ph["analysisStatus"] == "pending":
+            ph["analysisStatus"] = "failed"
+            ph["analysisError"] = "vision unavailable in mock_api"
+            ph["analyzedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
     return p
+
+
+def parse_photos(ctype, raw):
+    """-> (photos: list[bytes], note, error_message). Mirrors multer field filter + magic-byte sniff; > MAX_PHOTOS -> error."""
+    if not ctype.startswith("multipart/form-data"):
+        return [], None, "Add a photo of the outfit"
+    msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + raw)
+    photos, note = [], None
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if name == "photo":
+            if not re.match(r"image/(jpeg|png|webp|heic|heif|gif)", part.get_content_type() or ""):
+                return [], None, "Please upload a photo (JPG, PNG, HEIC or WebP)"
+            photos.append(part.get_payload(decode=True))
+            if len(photos) > MAX_PHOTOS:
+                return [], None, f"Up to {MAX_PHOTOS} photos per pick"
+        elif name == "note":
+            note = part.get_payload(decode=True).decode()
+    if not photos:
+        return [], None, "Add a photo of the outfit"
+    if any(sniff(b) is None for b in photos):
+        return [], None, "That file isn't a photo we can read"
+    return photos, note, None
+
+
+def store(photo):
+    path = f"/uploads/{int(time.time()*1000)}-{secrets.token_hex(8)}{sniff(photo)[0]}"
+    DB["files"][path] = photo
+    return path
 
 
 def session_view(s):
@@ -225,30 +279,17 @@ class H(BaseHTTPRequestHandler):
             s = DB["sessions"].get(int(m[1]))
             if not s or u["id"] not in DB["crews"][s["crewId"]]["members"]:
                 return self.send(404, {"message": "Session not found"})
-            if not ctype.startswith("multipart/form-data"):
-                return self.send(400, {"message": "Add a photo of the outfit"})
-            msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + raw)
-            photo, note = None, None
-            for part in msg.iter_parts():
-                name = part.get_param("name", header="content-disposition")
-                if name == "photo":
-                    if not re.match(r"image/(jpeg|png|webp|heic|heif|gif)", part.get_content_type() or ""):
-                        return self.send(400, {"message": "Please upload a photo (JPG, PNG, HEIC or WebP)"})
-                    photo = part.get_payload(decode=True)
-                elif name == "note":
-                    note = part.get_payload(decode=True).decode()
-            if photo is None:
-                return self.send(400, {"message": "Add a photo of the outfit"})
-            kind = sniff(photo)
-            if not kind:
-                return self.send(400, {"message": "That file isn't a photo we can read"})
-            path = f"/uploads/{int(time.time()*1000)}-{secrets.token_hex(8)}{kind[0]}"
-            DB["files"][path] = photo
+            photos, note, err = parse_photos(ctype, raw)
+            if err:
+                return self.send(400, {"message": err})
+            paths = [store(b) for b in photos]
             old = next((x for x in DB["picks"].values() if x["sessionId"] == s["id"] and x["userId"] == u["id"]), None)
-            fresh = {"photoPath": path, "note": note, "palette": [], "items": [], "locked": False, "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                     "analysisStatus": "pending", "analysisError": None, "analyzedAt": None}
+            fresh = {"photoPath": paths[0], "note": note, "palette": [], "items": [], "locked": False, "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     "analysisStatus": "pending", "analysisError": None, "analyzedAt": None, "photos": [new_photo(pa, i) for i, pa in enumerate(paths)]}
             if old:
-                DB["files"].pop(old["photoPath"], None)
+                for ph in old["photos"]:
+                    DB["files"].pop(ph["path"], None)
+                DB["reactions"] = [r for r in DB["reactions"] if r["pickId"] != old["id"]]
                 old.update(fresh)
                 pk = old
             else:
@@ -262,7 +303,40 @@ class H(BaseHTTPRequestHandler):
                 return self.send(404, {"message": "Pick not found"})
             if pk["userId"] != u["id"]:
                 return self.send(403, {"message": "Only the owner can re-run the analysis"})
-            pk.update(analysisStatus="pending", analysisError=None)
+            if any(ph["analysisStatus"] == "pending" for ph in pk["photos"]):
+                return self.send(202, pick_view(pk), extra={"Cache-Control": "no-store"})
+            failed = [ph for ph in pk["photos"] if ph["analysisStatus"] == "failed"]
+            for ph in failed or pk["photos"]:
+                ph.update(analysisStatus="pending", analysisError=None)
+            return self.send(200, pick_view(pk), extra={"Cache-Control": "no-store"})
+        m = re.fullmatch(r"/api/picks/(\d+)/photos", p)
+        if m:
+            pk = DB["picks"].get(int(m[1]))
+            if not pk:
+                return self.send(404, {"message": "Pick not found"})
+            if pk["userId"] != u["id"]:
+                return self.send(403, {"message": "Only the owner can change this pick"})
+            photos, _note, err = parse_photos(ctype, raw)
+            if err:
+                return self.send(400, {"message": err.replace("of the outfit", "")})
+            if len(pk["photos"]) + len(photos) > MAX_PHOTOS:
+                return self.send(400, {"message": f"Up to {MAX_PHOTOS} photos per pick (you have {len(pk['photos'])})", "max": MAX_PHOTOS, "current": len(pk["photos"])})
+            start = max([ph["position"] for ph in pk["photos"]] + [-1]) + 1
+            pk["photos"] += [new_photo(store(b), start + i) for i, b in enumerate(photos)]
+            return self.send(201, pick_view(pk), extra={"Cache-Control": "no-store"})
+        m = re.fullmatch(r"/api/picks/(\d+)/photos/(\d+)/analyze", p)
+        if m:
+            pk = DB["picks"].get(int(m[1]))
+            if not pk:
+                return self.send(404, {"message": "Pick not found"})
+            if pk["userId"] != u["id"]:
+                return self.send(403, {"message": "Only the owner can change this pick"})
+            ph = next((x for x in pk["photos"] if x["id"] == int(m[2])), None)
+            if not ph:
+                return self.send(404, {"message": "Photo not found"})
+            if ph["analysisStatus"] == "pending":
+                return self.send(202, pick_view(pk), extra={"Cache-Control": "no-store"})
+            ph.update(analysisStatus="pending", analysisError=None)
             return self.send(200, pick_view(pk), extra={"Cache-Control": "no-store"})
         m = re.fullmatch(r"/api/picks/(\d+)/reactions", p)
         if m:
@@ -320,8 +394,26 @@ class H(BaseHTTPRequestHandler):
             if not pk or pk["userId"] != u["id"]:
                 return self.send(404, {"message": "Pick not found"})
             DB["picks"].pop(pk["id"])
-            DB["files"].pop(pk["photoPath"], None)
+            for ph in pk["photos"]:
+                DB["files"].pop(ph["path"], None)
             return self.send(200, {"ok": True})
+        m = re.fullmatch(r"/api/picks/(\d+)/photos/(\d+)", self.path)
+        if m:
+            pk = DB["picks"].get(int(m[1]))
+            if not pk:
+                return self.send(404, {"message": "Pick not found"})
+            if pk["userId"] != u["id"]:
+                return self.send(403, {"message": "Only the owner can change this pick"})
+            ph = next((x for x in pk["photos"] if x["id"] == int(m[2])), None)
+            if not ph:
+                return self.send(404, {"message": "Photo not found"})
+            if len(pk["photos"]) <= 1:
+                return self.send(400, {"message": "A pick needs at least one photo - delete the pick instead"})
+            pk["photos"].remove(ph)
+            DB["files"].pop(ph["path"], None)
+            for i, x in enumerate(sorted(pk["photos"], key=lambda x: x["position"])):
+                x["position"] = i
+            return self.send(200, pick_view(pk), extra={"Cache-Control": "no-store"})
         self.send(404, {"message": "nope"})
 
 

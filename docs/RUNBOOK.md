@@ -112,12 +112,13 @@ What you will see in Render **Logs**:
 
 | Line | Meaning |
 | --- | --- |
-| `[analysis] pick 42 ready: 3 item(s) in 18342ms (upload)` | normal; the number in brackets is the trigger (`upload`, `retry`, `recovery`, `sweep`) |
-| `[analysis] pick 42 failed after 1203ms (upload): Gemini 429: …` | vision errored; the short reason is also stored on the pick (`analysisError`) and shown to the owner, who can tap retry (`POST /api/picks/:id/analyze`, 10 per hour per user) |
-| `[analysis] recovery: re-queued N pending pick(s) older than 120s` | printed once per boot; picks a previous process left `pending` are re-run (their photo is reloaded from storage) |
-| `[analysis] pick 42: photo changed before analysis started; skipping stale job` | the owner re-posted while a job was queued; harmless |
+| `[analysis] pick 42 photo 87 ready: 3 item(s) in 18342ms (upload)` | normal; one line per PHOTO (a pick can have up to 6); the word in brackets is the trigger (`upload`, `retry`, `recovery`, `sweep`) |
+| `[analysis] pick 42 photo 87 failed after 1203ms (upload): Gemini 429: …` | vision errored for that photo; the short reason is stored on the photo and, when no photo of the pick succeeded, on the pick (`analysisError`). The owner can retry the pick (`POST /api/picks/:id/analyze`, re-runs the failed photos) or one photo (`POST /api/picks/:id/photos/:photoId/analyze`); 10 retries per hour per user |
+| `[analysis] recovery: re-queued N pending photo(s) older than 120s` | printed once per boot; photos a previous process left `pending` are re-run (reloaded from storage) |
+| `[analysis] pick 42 photo 87: path changed before analysis started; skipping stale job` | the photo was removed/replaced while a job was queued; harmless |
+| `[db] pick_photos: back-filled N legacy pick(s)` | one-time migration: picks created before multi-photo support get their single photo copied into `pick_photos` |
 
-Knobs (environment variables, all optional): `VISION_CONCURRENCY` (default 2), `VISION_TIMEOUT_MS` (per Gemini call, default 120000), `VISION_RECOVERY_AGE_MS` (boot recovery threshold, default 120000), `VISION_SWEEP=0` disables the 10-minute safety sweep, `VISION_DOWNSCALE=0` skips the optional server-side resize (only active if the `sharp` package is installed — it is not by default; the app resizes photos to ~1280 px before upload).
+Knobs (environment variables, all optional): `PICK_MAX_PHOTOS` (photos per pick, default 6, max 12), `VISION_CONCURRENCY` (default 2), `VISION_TIMEOUT_MS` (per Gemini call, default 120000), `VISION_RECOVERY_AGE_MS` (boot recovery threshold, default 120000), `VISION_SWEEP=0` disables the 10-minute safety sweep, `VISION_DOWNSCALE=0` skips the optional server-side resize (only active if the `sharp` package is installed — it is not by default; the app resizes photos to ~1280 px before upload).
 
 If many picks sit in `pending` for minutes: the server is probably not running jobs (look for the recovery line after a restart) or Gemini is slow; `failed` picks with `Gemini 403/400` mean the key is missing or invalid (`GEMINI_API_KEY` on Render), `Gemini 429` means quota. Nothing is lost either way — the photo is stored and the crew sees it immediately; only the shopping pieces wait.
 

@@ -16,7 +16,11 @@ What it does (end to end, with two throwaway users):
      when vision is mocked synchronously) -> poll GET /api/picks/:id (Cache-Control: no-store) until
      ready/failed (<= 90 s) -> checks items/palette/analysisFailed, fetches photoPath
   -> POST /api/picks/:id/analyze: B (not owner) 403, A 200 pending -> poll again; unknown pick 404
-  -> upload as B -> .txt upload rejected 400 -> lazy prices for A's pick (200 {items}; offers may be
+  -> upload as B -> .txt upload rejected 400
+  -> multi-photo: B re-posts with 2 files (201, photos[] of 2, pending until BOTH settle) -> A adds a photo to
+     B's pick 403 -> B adds 1 (201, 3 photos) -> B adds 4 more -> 400 (max 6) -> 7 files in one POST 400 ->
+     B deletes photo 0 (200, renumbered, cover moves) -> per-photo retry (200/202) -> deleting the last photo 400
+  -> lazy prices for A's pick (200 {items}; offers may be
      empty without SERPAPI_KEY/HASDATA_API_KEY) -> lock/unlock pick -> emoji + comment reactions
   -> closet -> report a problem (POST /api/feedback 200 {id, kind, githubIssueUrl}, kind=suggestion 200,
      bad kind 400, missing message 400, admin endpoints 403 for a normal user) -> wrong PIN 401 -> repeated wrong PINs 429 -> no-token 401
@@ -306,10 +310,14 @@ def run(base):
         elapsed = time.time() - t0
         pick_a = expect(
             f"POST /api/sessions/:id/picks JPEG (A) -> 201 ({elapsed:.1f}s)", r, 201,
-            ["id", "photoPath", "items", "palette", "analysisStatus", "analysisFailed", "user", "reactions", "locked"],
+            ["id", "photoPath", "items", "palette", "analysisStatus", "analysisFailed", "user", "reactions", "locked", "photos"],
         )
         if not pick_a:
             raise Skip("upload failed")
+        check("single upload: photos[] has exactly 1 entry at position 0 whose url == photoPath",
+              isinstance(pick_a.get("photos"), list) and len(pick_a["photos"]) == 1 and pick_a["photos"][0].get("position") == 0
+              and pick_a["photos"][0].get("url") == pick_a["photoPath"] and set(pick_a["photos"][0]) >= {"id", "url", "position", "analysisStatus", "analysisError", "itemCount"},
+              str(pick_a.get("photos"))[:200])
         pick_ids.append((pick_a["id"], tok_a))
         check(f"upload responds in < {UPLOAD_FAST_S:.0f}s (analysis is async)", elapsed < UPLOAD_FAST_S, f"{elapsed:.1f}s")
         check("upload response Cache-Control: no-store", "no-store" in r.headers.get("Cache-Control", "").lower(), repr(r.headers.get("Cache-Control")))
@@ -383,9 +391,9 @@ def run(base):
         svs = expect("GET /api/sessions/:id after upload -> 200", r, 200, ["picks"])
         if svs:
             check("session view sends Cache-Control: no-store", "no-store" in r.headers.get("Cache-Control", "").lower(), repr(r.headers.get("Cache-Control")))
-            check("session.picks[] carry analysisStatus + analysisFailed",
-                  all("analysisStatus" in p and "analysisFailed" in p for p in svs["picks"]) and bool(svs["picks"]),
-                  [(p.get("id"), p.get("analysisStatus")) for p in svs["picks"]])
+            check("session.picks[] carry analysisStatus + analysisFailed + photos[]",
+                  all("analysisStatus" in p and "analysisFailed" in p and isinstance(p.get("photos"), list) and p["photos"] for p in svs["picks"]) and bool(svs["picks"]),
+                  [(p.get("id"), p.get("analysisStatus"), len(p.get("photos") or [])) for p in svs["picks"]])
 
         # fetch the photo
         photo_url = resolve_photo_url(base, pick_a["photoPath"])
@@ -431,6 +439,104 @@ def run(base):
         expect("POST picks without token -> 401", r, 401)
 
         pid_a = pick_a["id"]
+
+        # ---- multi-photo picks (B's pick: re-post with 2 files, add, delete, per-photo retry)
+        if pick_b:
+            r = api("POST", f"/api/sessions/{sess_id}/picks", tok_b,
+                    files=[("photo", ("full.jpg", jpeg, "image/jpeg")), ("photo", ("piece.jpg", jpeg, "image/jpeg"))], timeout=UPLOAD_TIMEOUT)
+            mb = expect("POST picks with 2 files (B re-post) -> 201 PickView with photos[]", r, 201, ["id", "photoPath", "photos", "analysisStatus"])
+            if mb:
+                check("multi: re-post keeps B's pick id", mb["id"] == pick_b["id"], f"{mb['id']} vs {pick_b['id']}")
+                check("multi: photos[] has 2 entries at positions 0,1 with distinct urls, cover == photoPath",
+                      len(mb["photos"]) == 2 and [p["position"] for p in mb["photos"]] == [0, 1] and mb["photos"][0]["url"] != mb["photos"][1]["url"]
+                      and mb["photos"][0]["url"] == mb["photoPath"], str(mb["photos"])[:200])
+                check("multi: pick-level analysisStatus pending|ready|failed on upload", mb["analysisStatus"] in ANALYSIS_STATUSES, repr(mb["analysisStatus"]))
+                if mb["analysisStatus"] == "pending":
+                    check("multi: every photo pending right after upload", all(p["analysisStatus"] == "pending" for p in mb["photos"]), str(mb["photos"])[:200])
+                # the pick must stay pending until BOTH photos settled
+                t0 = time.time()
+                inconsistent = None
+                cur = mb
+                while time.time() - t0 < ANALYSIS_TIMEOUT:
+                    cur = api("GET", f"/api/picks/{mb['id']}", tok_a).json()
+                    photo_statuses = [p["analysisStatus"] for p in cur["photos"]]
+                    if cur["analysisStatus"] != "pending" and "pending" in photo_statuses:
+                        inconsistent = photo_statuses
+                    if cur["analysisStatus"] != "pending":
+                        break
+                    time.sleep(1.0)
+                check("multi: pick-level status settles (pending until every photo settled)", cur["analysisStatus"] in ("ready", "failed") and inconsistent is None,
+                      f"status={cur['analysisStatus']} photos={[p['analysisStatus'] for p in cur['photos']]} inconsistent={inconsistent}")
+                check("multi: aggregate status rule (pending if any pending, else ready if any ready, else failed)",
+                      cur["analysisStatus"] == ("pending" if any(p["analysisStatus"] == "pending" for p in cur["photos"]) else "ready" if any(p["analysisStatus"] == "ready" for p in cur["photos"]) else "failed"),
+                      f"{cur['analysisStatus']} {[p['analysisStatus'] for p in cur['photos']]}")
+                check("multi: items count <= 12 and >= per-photo itemCount, palette <= 6",
+                      len(cur["items"]) <= 12 and len(cur["palette"]) <= 6 and len(cur["items"]) >= max([p["itemCount"] for p in cur["photos"]] or [0]),
+                      f"items={len(cur['items'])} palette={len(cur['palette'])} photos={[p['itemCount'] for p in cur['photos']]}")
+                if cur["analysisStatus"] == "failed":
+                    check("multi: all failed -> analysisError = first failed photo's error", cur["analysisError"] == cur["photos"][0]["analysisError"] and cur["analysisError"], repr(cur["analysisError"]))
+                else:
+                    check("multi: ready -> analysisError null", cur["analysisError"] is None, repr(cur["analysisError"]))
+                print(f"  >> MULTI: 2-photo pick settled {cur['analysisStatus']} with {len(cur['items'])} merged item(s), photos={[p['analysisStatus'] for p in cur['photos']]}")
+
+                # add photos
+                r = api("POST", f"/api/picks/{mb['id']}/photos", tok_a, files=[("photo", ("x.jpg", jpeg, "image/jpeg"))], timeout=UPLOAD_TIMEOUT)
+                expect("POST /api/picks/:id/photos by non-owner (A) -> 403", r, 403)
+                r = api("POST", f"/api/picks/{mb['id']}/photos", files=[("photo", ("x.jpg", jpeg, "image/jpeg"))], timeout=UPLOAD_TIMEOUT)
+                expect("POST /api/picks/:id/photos without token -> 401", r, 401)
+                r = api("POST", "/api/picks/999999999/photos", tok_b, files=[("photo", ("x.jpg", jpeg, "image/jpeg"))], timeout=UPLOAD_TIMEOUT)
+                expect("POST /api/picks/:id/photos unknown pick -> 404", r, 404)
+                r = api("POST", f"/api/picks/{mb['id']}/photos", tok_b, files=[("photo", ("third.jpg", jpeg, "image/jpeg"))], timeout=UPLOAD_TIMEOUT)
+                ad = expect("POST /api/picks/:id/photos by owner (B) -> 201 PickView", r, 201, ["id", "photos", "analysisStatus"])
+                if ad:
+                    check("add photo: 3 photos, new one at position 2, pick pending again (or settled by a sync mock)",
+                          len(ad["photos"]) == 3 and ad["photos"][2]["position"] == 2 and ad["analysisStatus"] in ANALYSIS_STATUSES, str(ad["photos"])[:200])
+                    check("add photo: response Cache-Control: no-store", "no-store" in r.headers.get("Cache-Control", "").lower(), repr(r.headers.get("Cache-Control")))
+                r = api("POST", f"/api/picks/{mb['id']}/photos", tok_b, files=[("photo", (f"m{i}.jpg", jpeg, "image/jpeg")) for i in range(4)], timeout=UPLOAD_TIMEOUT)
+                expect("POST /api/picks/:id/photos 3 + 4 = 7 -> 400 (max 6 per pick)", r, 400)
+                r = api("POST", f"/api/sessions/{sess_id}/picks", tok_b, files=[("photo", (f"s{i}.jpg", jpeg, "image/jpeg")) for i in range(7)], timeout=UPLOAD_TIMEOUT)
+                expect("POST picks with 7 files in one request -> 400", r, 400)
+                wait_for_analysis(api, mb["id"], tok_b, "B's 3-photo pick")
+
+                # delete a photo
+                cur = api("GET", f"/api/picks/{mb['id']}", tok_b).json()
+                cover_id, second_url = cur["photos"][0]["id"], cur["photos"][1]["url"]
+                r = api("DELETE", f"/api/picks/{mb['id']}/photos/{cover_id}", tok_a)
+                expect("DELETE /api/picks/:id/photos/:photoId by non-owner (A) -> 403", r, 403)
+                r = api("DELETE", f"/api/picks/{mb['id']}/photos/999999999", tok_b)
+                expect("DELETE /api/picks/:id/photos/:photoId unknown photo -> 404", r, 404)
+                r = api("DELETE", f"/api/picks/{mb['id']}/photos/{cover_id}", tok_b)
+                dl = expect("DELETE /api/picks/:id/photos/:photoId (owner deletes cover) -> 200 PickView", r, 200, ["photos", "photoPath"])
+                if dl:
+                    check("delete photo: 2 photos left, renumbered 0,1, cover moved to the old second photo",
+                          [p["position"] for p in dl["photos"]] == [0, 1] and dl["photoPath"] == second_url == dl["photos"][0]["url"] and all(p["id"] != cover_id for p in dl["photos"]),
+                          str(dl["photos"])[:200])
+                    old_cover_url = cur["photos"][0]["url"]
+                    time.sleep(0.5)
+                    pr2 = s.get(resolve_photo_url(base, old_cover_url), timeout=TIMEOUT)
+                    record("delete photo: removed file no longer served (404/400)", pr2.status_code in (400, 404), f"HTTP {pr2.status_code} {old_cover_url[:80]}")
+
+                # per-photo retry
+                cur = api("GET", f"/api/picks/{mb['id']}", tok_b).json()
+                ph0 = cur["photos"][0]["id"]
+                r = api("POST", f"/api/picks/{mb['id']}/photos/{ph0}/analyze", tok_a)
+                expect("POST /api/picks/:id/photos/:photoId/analyze by non-owner (A) -> 403", r, 403)
+                r = api("POST", f"/api/picks/{mb['id']}/photos/{ph0}/analyze", tok_b)
+                pa = expect("POST /api/picks/:id/photos/:photoId/analyze by owner (B) -> 200 (or 202 if still pending)", r, 200 if cur["analysisStatus"] != "pending" else 202, ["photos", "analysisStatus"])
+                if pa:
+                    check("photo retry: that photo pending (unless a sync mock already settled it), the other untouched",
+                          pa["photos"][0]["analysisStatus"] in ANALYSIS_STATUSES and pa["photos"][1]["analysisStatus"] == cur["photos"][1]["analysisStatus"], str(pa["photos"])[:200])
+                    check("photo retry: response Cache-Control: no-store", "no-store" in r.headers.get("Cache-Control", "").lower(), repr(r.headers.get("Cache-Control")))
+                    wait_for_analysis(api, mb["id"], tok_b, "after per-photo retry")
+
+                # last photo cannot be deleted
+                cur = api("GET", f"/api/picks/{mb['id']}", tok_b).json()
+                r = api("DELETE", f"/api/picks/{mb['id']}/photos/{cur['photos'][1]['id']}", tok_b)
+                expect("DELETE second-to-last photo -> 200", r, 200, ["photos"])
+                cur = api("GET", f"/api/picks/{mb['id']}", tok_b).json()
+                r = api("DELETE", f"/api/picks/{mb['id']}/photos/{cur['photos'][0]['id']}", tok_b)
+                expect("DELETE the last photo -> 400 (delete the pick instead)", r, 400)
+                check("last photo still there after the refused delete", len(api("GET", f"/api/picks/{mb['id']}", tok_b).json()["photos"]) == 1)
 
         # ---- lazy shopping prices (offers are [] when no provider key is configured; that's fine)
         r = api("GET", f"/api/picks/{pid_a}/prices", tok_b, timeout=60)

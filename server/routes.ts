@@ -10,7 +10,10 @@ import { lookupOffers, buildShoppingQuery } from "./prices";
 import { presentOffers } from "./affiliate";
 import { registerFeedbackRoutes, isAdmin } from "./feedback";
 import type { User, PricedItem } from "@shared/schema";
-import { ACTIVITIES, SHOP_FOR } from "@shared/schema";
+import { ACTIVITIES, SHOP_FOR, PICK_MAX_PHOTOS_DEFAULT } from "@shared/schema";
+
+/** Photos per pick (upload + later additions). PICK_MAX_PHOTOS env, default 6, clamped to 1..12. */
+const PICK_MAX_PHOTOS = Math.min(12, Math.max(1, Number(process.env.PICK_MAX_PHOTOS || PICK_MAX_PHOTOS_DEFAULT) || PICK_MAX_PHOTOS_DEFAULT));
 
 // ---- tiny in-memory rate limiter (per key, sliding window) ----
 const buckets = new Map<string, number[]>();
@@ -209,11 +212,52 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // ---------- picks ----------
-  const uploadPhoto = (req: Request, res: Response, next: NextFunction) =>
-    upload.single("photo")(req, res, (err?: unknown) => {
-      if (err) return res.status(400).json({ message: (err as Error).message || "Upload failed" });
+  // Up to PICK_MAX_PHOTOS files per request / per pick under the multipart field `photo` (a single file works as before).
+  const uploadPhotos = (req: Request, res: Response, next: NextFunction) =>
+    upload.array("photo", PICK_MAX_PHOTOS)(req, res, (err?: unknown) => {
+      if (err) {
+        const code = (err as { code?: string }).code;
+        if (code === "LIMIT_UNEXPECTED_FILE") return res.status(400).json({ message: `Up to ${PICK_MAX_PHOTOS} photos per pick` });
+        if (code === "LIMIT_FILE_SIZE") return res.status(400).json({ message: "Each photo must be under 12 MB" });
+        return res.status(400).json({ message: (err as Error).message || "Upload failed" });
+      }
       next();
     });
+  const uploadedFiles = (req: Request): Express.Multer.File[] => (Array.isArray(req.files) ? req.files : []);
+
+  /** Sniff every file (don't trust declared MIME); returns the bad index or the kinds. */
+  const sniffAll = (fs: Express.Multer.File[]): { kinds: { ext: string; mime: string }[] } | { bad: number } => {
+    const kinds: { ext: string; mime: string }[] = [];
+    for (let i = 0; i < fs.length; i++) {
+      const kind = sniffImage(fs[i].buffer);
+      if (!kind) return { bad: i };
+      kinds.push(kind);
+    }
+    return { kinds };
+  };
+
+  /** Store all files; on a failure half-way remove what was already written and rethrow. */
+  const storeAll = async (fs: Express.Multer.File[], kinds: { ext: string; mime: string }[]): Promise<string[]> => {
+    const paths: string[] = [];
+    try {
+      for (let i = 0; i < fs.length; i++) paths.push(await files.put(fs[i].buffer, kinds[i].ext, kinds[i].mime));
+      return paths;
+    } catch (err) {
+      for (const p of paths) void removeUpload(p);
+      throw err;
+    }
+  };
+
+  const enqueuePhotos = (pickId: number, photos: { id: number; path: string }[], fs: Express.Multer.File[] | null, kinds: { mime: string }[] | null, reason: "upload" | "retry") => {
+    // Fire-and-forget: enqueueAnalysis never throws, and job errors are recorded on the row.
+    for (let i = 0; i < photos.length; i++) {
+      try {
+        enqueueAnalysis({ photoId: photos[i].id, pickId, photoPath: photos[i].path, buffer: fs?.[i]?.buffer, mime: kinds?.[i]?.mime, reason });
+      } catch (err) {
+        console.error("[analysis] enqueue failed", err);
+      }
+    }
+  };
 
   const requireSessionMember = async (req: Request, res: Response, next: NextFunction) => {
     const s = await storage.getSession(Number(req.params.id));
@@ -224,37 +268,26 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   };
 
   /**
-   * Post an outfit. Responds 201 as soon as the photo is stored; the Gemini analysis runs in the background
-   * (server/analysis.ts) and the PickView comes back with analysisStatus "pending", items [] and palette [].
-   * Poll GET /api/picks/:id until analysisStatus is "ready" | "failed".
+   * Post an outfit: 1..PICK_MAX_PHOTOS photos under `photo` (full-outfit shots and/or single pieces) + optional `note`.
+   * Responds 201 as soon as the photos are stored; every photo is analysed in the background (server/analysis.ts)
+   * and the PickView comes back with analysisStatus "pending", items [] and palette [] plus photos[] (all pending).
+   * Poll GET /api/picks/:id until analysisStatus is "ready" | "failed" (pending while ANY photo is pending).
+   * Re-posting replaces the whole pick (same id, all photos) for that user+session.
    */
-  app.post("/api/sessions/:id/picks", requireAuth, requireSessionMember, uploadPhoto, noStore, async (req, res) => {
+  app.post("/api/sessions/:id/picks", requireAuth, requireSessionMember, uploadPhotos, noStore, async (req, res) => {
     const s = (await storage.getSession(Number(req.params.id)))!;
     const user = (req as AuthedRequest).user;
-    if (!req.file) return res.status(400).json({ message: "Add a photo of the outfit" });
-    const kind = sniffImage(req.file.buffer);
-    if (!kind) return res.status(400).json({ message: "That file isn't a photo we can read (JPG, PNG, HEIC or WebP)" });
+    const fs = uploadedFiles(req);
+    if (fs.length === 0) return res.status(400).json({ message: "Add a photo of the outfit" });
+    const sniffed = sniffAll(fs);
+    if ("bad" in sniffed) return res.status(400).json({ message: "That file isn't a photo we can read (JPG, PNG, HEIC or WebP)" });
     const note = typeof req.body.note === "string" ? req.body.note.slice(0, 200).trim() : null;
 
-    const previous = await storage.getPickForUser(s.id, user.id);
-    const photoPath = await files.put(req.file.buffer, kind.ext, kind.mime);
-    const pick = await storage.upsertPick({
-      sessionId: s.id,
-      userId: user.id,
-      photoPath,
-      note: note || null,
-      palette: [],
-      items: [],
-      analysisStatus: "pending",
-    });
-    if (previous && previous.photoPath !== pick.photoPath) void removeUpload(previous.photoPath);
-    res.status(201).json(await storage.pickView(pick));
-    // Fire-and-forget: enqueueAnalysis never throws, and job errors are recorded on the row.
-    try {
-      enqueueAnalysis({ pickId: pick.id, photoPath, buffer: req.file.buffer, mime: kind.mime, reason: "upload" });
-    } catch (err) {
-      console.error("[analysis] enqueue failed", err);
-    }
+    const paths = await storeAll(fs, sniffed.kinds);
+    const { pick, photos, previousPhotoPaths } = await storage.upsertPick({ sessionId: s.id, userId: user.id, photoPaths: paths, note: note || null });
+    for (const old of previousPhotoPaths) if (!paths.includes(old)) void removeUpload(old);
+    res.status(201).json(await storage.pickView(pick, undefined, photos));
+    enqueuePhotos(pick.id, photos, fs, sniffed.kinds, "upload");
   });
 
   // Poll target for the background analysis (any crew member). Same PickView shape as the session view.
@@ -267,21 +300,90 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(await storage.pickView(pick));
   });
 
-  // Owner-only: re-run the outfit analysis (after a failure, or to refresh). Returns the PickView with status "pending".
+  /** Owner-only pick lookup for the photo endpoints: 404 unknown, 403 not the owner. */
+  const ownedPick = async (req: Request, res: Response) => {
+    const pick = await storage.getPick(Number(req.params.id));
+    const user = (req as AuthedRequest).user;
+    if (!pick) {
+      res.status(404).json({ message: "Pick not found" });
+      return null;
+    }
+    if (pick.userId !== user.id) {
+      res.status(403).json({ message: "Only the owner can change this pick" });
+      return null;
+    }
+    return pick;
+  };
+
+  /**
+   * Add 1..N more photos to an existing pick (owner only). 400 when the total would exceed PICK_MAX_PHOTOS.
+   * Returns 201 with the PickView: new photos are appended (positions continue) and queued for analysis, so the
+   * pick-level analysisStatus goes back to "pending" until they settle.
+   */
+  app.post("/api/picks/:id/photos", requireAuth, uploadPhotos, noStore, async (req, res) => {
+    const pick = await ownedPick(req, res);
+    if (!pick) return;
+    const user = (req as AuthedRequest).user;
+    const fs = uploadedFiles(req);
+    if (fs.length === 0) return res.status(400).json({ message: "Add a photo" });
+    const existing = await storage.photosForPick(pick.id);
+    if (existing.length + fs.length > PICK_MAX_PHOTOS)
+      return res.status(400).json({ message: `Up to ${PICK_MAX_PHOTOS} photos per pick (you have ${existing.length})`, max: PICK_MAX_PHOTOS, current: existing.length });
+    const sniffed = sniffAll(fs);
+    if ("bad" in sniffed) return res.status(400).json({ message: "That file isn't a photo we can read (JPG, PNG, HEIC or WebP)" });
+    if (limited(`upload:${user.id}`, 20, 60 * 60 * 1000)) return res.status(429).json({ message: "That's a lot of photos. Try again in a bit." });
+    const paths = await storeAll(fs, sniffed.kinds);
+    const added = await storage.addPhotos(pick.id, paths);
+    const fresh = (await storage.getPick(pick.id)) ?? pick;
+    res.status(201).json(await storage.pickView(fresh));
+    enqueuePhotos(pick.id, added, fs, sniffed.kinds, "upload");
+  });
+
+  /** Remove one photo (owner only). The last photo cannot be removed (400): delete the pick instead. Positions are renumbered. */
+  app.delete("/api/picks/:id/photos/:photoId", requireAuth, noStore, async (req, res) => {
+    const pick = await ownedPick(req, res);
+    if (!pick) return;
+    const result = await storage.deletePhoto(pick.id, Number(req.params.photoId));
+    if (result.last) return res.status(400).json({ message: "A pick needs at least one photo - delete the pick instead" });
+    if (!result.removed) return res.status(404).json({ message: "Photo not found" });
+    void removeUpload(result.removed.path);
+    const fresh = (await storage.getPick(pick.id)) ?? pick;
+    res.json(await storage.pickView(fresh));
+  });
+
+  /** Owner-only: re-run the analysis of ONE photo. 202 + current view if that photo is already pending. */
+  app.post("/api/picks/:id/photos/:photoId/analyze", requireAuth, noStore, async (req, res) => {
+    const pick = await ownedPick(req, res);
+    if (!pick) return;
+    const user = (req as AuthedRequest).user;
+    const photo = await storage.getPhoto(Number(req.params.photoId));
+    if (!photo || photo.pickId !== pick.id) return res.status(404).json({ message: "Photo not found" });
+    if (photo.analysisStatus === "pending") return res.status(202).json(await storage.pickView(pick)); // already queued
+    if (limited(`analyze:${user.id}`, 10, 60 * 60 * 1000)) return res.status(429).json({ message: "Too many retries. Try again in a bit." });
+    const marked = await storage.markPhotosPending(pick.id, [photo.id]);
+    const fresh = (await storage.getPick(pick.id)) ?? pick;
+    res.json(await storage.pickView(fresh));
+    enqueuePhotos(pick.id, marked, null, null, "retry");
+  });
+
+  /**
+   * Owner-only: re-run the outfit analysis. Re-queues every FAILED photo (or every photo when none failed).
+   * Returns the PickView with status "pending"; 202 + current view when a photo is already pending (no new jobs).
+   */
   app.post("/api/picks/:id/analyze", requireAuth, noStore, async (req, res) => {
     const pick = await storage.getPick(Number(req.params.id));
     const user = (req as AuthedRequest).user;
     if (!pick) return res.status(404).json({ message: "Pick not found" });
     if (pick.userId !== user.id) return res.status(403).json({ message: "Only the owner can re-run the analysis" });
-    if (pick.analysisStatus === "pending") return res.status(202).json(await storage.pickView(pick)); // already queued
+    const photos = await storage.photosForPick(pick.id);
+    if (photos.some((p) => p.analysisStatus === "pending")) return res.status(202).json(await storage.pickView(pick, undefined, photos)); // already queued
     if (limited(`analyze:${user.id}`, 10, 60 * 60 * 1000)) return res.status(429).json({ message: "Too many retries. Try again in a bit." });
-    const updated = (await storage.markAnalysisPending(pick.id)) ?? pick;
-    res.json(await storage.pickView(updated));
-    try {
-      enqueueAnalysis({ pickId: pick.id, photoPath: updated.photoPath, reason: "retry" });
-    } catch (err) {
-      console.error("[analysis] enqueue failed", err);
-    }
+    const failed = photos.filter((p) => p.analysisStatus === "failed");
+    const targets = failed.length > 0 ? failed : photos;
+    const marked = await storage.markPhotosPending(pick.id, targets.map((p) => p.id));
+    const fresh = (await storage.getPick(pick.id)) ?? pick;
+    res.json(await storage.pickView(fresh));
+    enqueuePhotos(pick.id, marked, null, null, "retry");
   });
 
   app.patch("/api/picks/:id", requireAuth, async (req, res) => {
@@ -297,8 +399,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const pick = await storage.getPick(Number(req.params.id));
     const user = (req as AuthedRequest).user;
     if (!pick || pick.userId !== user.id) return res.status(404).json({ message: "Pick not found" });
-    await storage.deletePick(pick.id);
-    void removeUpload(pick.photoPath);
+    const paths = await storage.deletePick(pick.id);
+    for (const p of paths) void removeUpload(p);
     res.json({ ok: true });
   });
 

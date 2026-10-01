@@ -1,4 +1,4 @@
-import { pgTable, text, integer, serial, boolean, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, serial, boolean, timestamp, jsonb } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import type * as z from "zod/mini";
 import { z as zod } from "zod";
@@ -143,14 +143,28 @@ export interface GarmentItem {
 export const ANALYSIS_STATUSES = ["pending", "ready", "failed"] as const;
 export type AnalysisStatus = (typeof ANALYSIS_STATUSES)[number];
 
+/**
+ * A pick holds 1..PICK_MAX_PHOTOS photos (default 6): full-outfit shots and/or single pieces (laid flat, on a
+ * hanger, held up). Every photo is analysed on its own (server/analysis.ts, one job per photo) and the pick-level
+ * `items` / `palette` / `analysisStatus` / `analysisError` / `photoPath` are AGGREGATES recomputed from the photos:
+ *   items          concat of photo items in position order, near-duplicates merged, max 12
+ *   palette        distinct hexes in position order, max 6
+ *   analysisStatus pending if any photo is pending, else ready if any is ready, else failed
+ *   analysisError  first failed photo's error when no photo is ready, else null
+ *   photoPath      the cover = photo at position 0
+ */
+export const PICK_MAX_PHOTOS_DEFAULT = 6;
+export const PICK_MAX_ITEMS = 12;
+export const PICK_MAX_PALETTE = 6;
+
 export const picks = pgTable("picks", {
   id: serial("id").primaryKey(),
   sessionId: integer("session_id").notNull(),
   userId: integer("user_id").notNull(),
-  photoPath: text("photo_path").notNull(),
-  note: text("note"),
-  palette: text("palette").notNull().default("[]"), // JSON string[] of hex
-  items: text("items").notNull().default("[]"), // JSON GarmentItem[]
+  photoPath: text("photo_path").notNull(), // cover photo (pick_photos.position = 0); kept for compatibility
+  note: text("note"), // the owner's own text; PickView.note falls back to the first ready photo's summary
+  palette: text("palette").notNull().default("[]"), // JSON string[] of hex (aggregate over photos)
+  items: text("items").notNull().default("[]"), // JSON GarmentItem[] (aggregate over photos)
   locked: boolean("locked").notNull().default(false),
   createdAt: text("created_at").notNull(),
   analysisStatus: text("analysis_status").$type<AnalysisStatus>().notNull().default("ready"),
@@ -158,6 +172,35 @@ export const picks = pgTable("picks", {
   analyzedAt: timestamp("analyzed_at", { withTimezone: true, mode: "date" }), // when the last analysis finished (ready or failed)
 });
 export type Pick = typeof picks.$inferSelect;
+
+/** One photo of a pick. Rows are created with the pick (or POST /api/picks/:id/photos) and deleted with it (FK cascade). */
+export const pickPhotos = pgTable("pick_photos", {
+  id: serial("id").primaryKey(),
+  pickId: integer("pick_id")
+    .notNull()
+    .references(() => picks.id, { onDelete: "cascade" }),
+  path: text("path").notNull(), // files.ts photoPath (absolute Supabase URL or /uploads/...)
+  position: integer("position").notNull().default(0), // 0 = cover; contiguous, renumbered on delete
+  analysisStatus: text("analysis_status").$type<AnalysisStatus>().notNull().default("pending"),
+  analysisError: text("analysis_error"),
+  items: jsonb("items").$type<GarmentItem[]>().notNull().default([]),
+  palette: jsonb("palette").$type<string[]>().notNull().default([]),
+  summary: text("summary"), // vision's one-line summary of THIS photo
+  analyzedAt: timestamp("analyzed_at", { withTimezone: true, mode: "date" }),
+  createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull().defaultNow(),
+});
+export type PickPhoto = typeof pickPhotos.$inferSelect;
+
+/** Per-photo entry of PickView.photos (ordered by position; photos[0] is the cover = PickView.photoPath). */
+export interface PickPhotoView {
+  id: number;
+  url: string;
+  position: number;
+  analysisStatus: AnalysisStatus;
+  analysisError: string | null;
+  itemCount: number;
+}
+
 export interface PickView extends Omit<Pick, "palette" | "items"> {
   palette: string[];
   items: GarmentItem[];
@@ -165,6 +208,8 @@ export interface PickView extends Omit<Pick, "palette" | "items"> {
   reactions: ReactionView[];
   /** Compatibility alias: `analysisStatus === "failed"`. Prefer analysisStatus. */
   analysisFailed: boolean;
+  /** All photos of the pick, position order. Add with POST /api/picks/:id/photos, remove with DELETE /api/picks/:id/photos/:photoId. */
+  photos: PickPhotoView[];
 }
 
 // ---------- Reactions (emoji or short comment on a pick) ----------

@@ -45,12 +45,16 @@ export function buildLinks(query: string, brand: string | null): { label: string
 }
 
 const SYSTEM = `You identify activewear and athleisure garments in a photo so friends can coordinate outfits and shop for the pieces.
+The photo is ONE of two kinds:
+  (a) a full outfit worn by a person (mirror selfie, full-body shot), or
+  (b) a SINGLE piece shown on its own: a garment, pair of shoes or accessory laid flat on a bed/floor, on a hanger, held up to the camera, or a product-style shot.
+Describe only what is actually visible. Never invent pieces that are not in the frame (no "probably wearing shoes" for a flat-lay top; no bottoms for a hanging jacket). For (b) return 1-2 items (the piece itself, plus a second one only if a second distinct piece is clearly in the shot).
 Return ONLY compact JSON with this exact shape and nothing else:
 {"summary": string, "palette": string[], "items": [{"category": string, "description": string, "colorName": string, "colorHex": string, "brandGuess": string|null, "searchQuery": string, "fit": "womens"|"mens"|"unisex"}]}
 Rules:
-- summary: 6-12 words describing the outfit, e.g. "Black high-rise leggings with sage cropped tank".
-- palette: 2-4 dominant outfit colors as hex, most prominent first. Ignore skin, hair and background.
-- items: one entry per visible garment or shoe (sports bra, tank, leggings, shorts, hoodie, jacket, shoes, socks, hat, bag). 2-6 items.
+- summary: 6-12 words describing what is in the photo, e.g. "Black high-rise leggings with sage cropped tank" or, for a single piece, "Sage green ribbed cropped tank top".
+- palette: 2-4 dominant garment colors as hex, most prominent first. Ignore skin, hair, hangers, bedding and background.
+- items: one entry per visible garment, shoe or accessory (sports bra, tank, leggings, shorts, hoodie, jacket, shoes, socks, hat, bag). Full outfit: 2-6 items. Single piece: 1-2 items.
 - brandGuess: only if a logo or unmistakable signature is visible; otherwise null. Never guess.
 - searchQuery: 4-8 words a shopper would type to find this exact style, including color, fit and brand if known. Example: "lululemon align high rise legging black 25". Do NOT add "women's"/"men's" here; use the fit field.
 - fit: the department this piece is sold in, judged from the garment's own cut and styling, never from the wearer. "womens" for sports bras, leggings with a high-rise yoga cut, cropped tanks, skorts, bike shorts with a women's cut, flared pants; "mens" for boxy tees, basketball/7" lined shorts, men's compression gear or cuts clearly from a men's line; "unisex" for hoodies, crewnecks, socks, hats, bags, sneakers and whenever you are not sure. Default to "unisex".
@@ -95,7 +99,8 @@ export async function analyzeOutfit(image: Buffer | string, mimeType: string): P
   // Some models reject thinkingConfig; retry those without it.
   const payloadNoThinking = payload.replace(/,\s*"thinkingConfig":\{[^}]*\}/, "");
 
-  // Try each model in order; retry transient 429/503 once per model with a short pause.
+  // Try each model in order. 429 (quota): pause 1.5 s and retry the same model; 503 ("high demand"): move to the
+  // next model immediately - pausing/retrying per model stretched a live analysis to ~56 s when several were busy.
   type GeminiBody = { candidates?: { finishReason?: string; content?: { parts?: { text?: string; thought?: boolean }[] } }[] };
   let lastErr = "";
   for (const rawModel of GEMINI_MODELS) {
@@ -115,11 +120,11 @@ export async function analyzeOutfit(image: Buffer | string, mimeType: string): P
           useThinkingCfg = false; // model doesn't accept thinkingConfig → retry plain
           continue;
         }
-        if (res.status === 429 || res.status === 503) {
+        if (res.status === 429) {
           await new Promise((r) => setTimeout(r, 1500));
           continue;
         }
-        break; // 404 / 400 etc: move to next model
+        break; // 503 / 404 / 400 etc: next model right away
       }
       const body = (await res.json()) as GeminiBody;
       const cand = body.candidates?.[0];

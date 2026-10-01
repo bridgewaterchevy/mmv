@@ -125,6 +125,23 @@ const DDL = [
   `CREATE INDEX IF NOT EXISTS picks_session_idx ON picks (session_id)`,
   `CREATE INDEX IF NOT EXISTS picks_user_idx ON picks (user_id)`,
   `CREATE INDEX IF NOT EXISTS picks_analysis_status_idx ON picks (analysis_status)`,
+  // Several photos per pick (full outfit and/or single pieces); each analysed on its own. The picks row keeps the
+  // aggregates (items/palette/status) and photo_path = cover. Legacy picks are back-filled in migratePickPhotos().
+  `CREATE TABLE IF NOT EXISTS pick_photos (
+    id SERIAL PRIMARY KEY,
+    pick_id INTEGER NOT NULL REFERENCES picks(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    analysis_status TEXT NOT NULL DEFAULT 'pending',
+    analysis_error TEXT,
+    items JSONB NOT NULL DEFAULT '[]'::jsonb,
+    palette JSONB NOT NULL DEFAULT '[]'::jsonb,
+    summary TEXT,
+    analyzed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS pick_photos_pick_idx ON pick_photos (pick_id, position)`,
+  `CREATE INDEX IF NOT EXISTS pick_photos_status_idx ON pick_photos (analysis_status)`,
   `CREATE TABLE IF NOT EXISTS reactions (
     id SERIAL PRIMARY KEY,
     pick_id INTEGER NOT NULL,
@@ -166,4 +183,49 @@ const DDL = [
 
 async function migrate(db: Db) {
   for (const stmt of DDL) await db.execute(sql.raw(stmt));
+  await migratePickPhotos(db);
+}
+
+/**
+ * Back-fill: every pick without a pick_photos row gets one from its own photo_path (position 0) carrying the
+ * pick's status / items / palette / error / analyzed_at, so existing outfits keep their analysis. Done row by row
+ * in JS so a malformed legacy JSON string cannot abort the boot (it is stored as [] instead).
+ */
+async function migratePickPhotos(db: Db) {
+  const res = await db.execute(sql`
+    SELECT p.id, p.photo_path, p.analysis_status, p.analysis_error, p.items, p.palette, p.analyzed_at, p.created_at
+    FROM picks p
+    WHERE NOT EXISTS (SELECT 1 FROM pick_photos ph WHERE ph.pick_id = p.id)
+    ORDER BY p.id`);
+  const rows = (Array.isArray(res) ? res : ((res as { rows?: unknown[] }).rows ?? [])) as Record<string, unknown>[];
+  if (rows.length === 0) return;
+  const parseJson = (v: unknown): unknown[] => {
+    if (Array.isArray(v)) return v;
+    try {
+      const parsed = JSON.parse(String(v ?? "[]"));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+  let n = 0;
+  for (const r of rows) {
+    const status = r.analysis_status === "pending" || r.analysis_status === "failed" ? String(r.analysis_status) : "ready";
+    const analyzedAt = r.analyzed_at ? new Date(r.analyzed_at as string | Date) : status === "ready" ? new Date() : null;
+    const createdAt = (() => {
+      const d = new Date(String(r.created_at ?? ""));
+      return Number.isNaN(d.getTime()) ? new Date() : d;
+    })();
+    try {
+      await db.execute(sql`
+        INSERT INTO pick_photos (pick_id, path, position, analysis_status, analysis_error, items, palette, summary, analyzed_at, created_at)
+        VALUES (${r.id as number}, ${String(r.photo_path)}, 0, ${status}, ${(r.analysis_error as string | null) ?? null},
+                ${JSON.stringify(parseJson(r.items))}::jsonb, ${JSON.stringify(parseJson(r.palette))}::jsonb, NULL,
+                ${analyzedAt}, ${createdAt})`);
+      n++;
+    } catch (err) {
+      console.error(`[db] pick_photos back-fill failed for pick ${String(r.id)}`, err);
+    }
+  }
+  console.log(`[db] pick_photos: back-filled ${n} legacy pick(s)`);
 }

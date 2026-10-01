@@ -4,6 +4,7 @@ import {
   crewMembers,
   sessions,
   picks,
+  pickPhotos,
   reactions,
   feedback,
 } from "@shared/schema";
@@ -16,6 +17,8 @@ import type {
   SessionView,
   Pick,
   PickView,
+  PickPhoto,
+  PickPhotoView,
   Reaction,
   ReactionView,
   GarmentItem,
@@ -29,6 +32,8 @@ import type {
 import { and, eq, inArray, desc, asc, count, gte, lt } from "drizzle-orm";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { getDb } from "./db";
+import type { Db } from "./db";
+import { aggregatePhotos } from "./aggregate";
 import { wrapItems } from "./affiliate";
 import { applyShoppingHints } from "./prices";
 
@@ -226,28 +231,91 @@ export class DatabaseStorage {
     const crew = (await this.getCrew(s.crewId))!;
     const members = await this.getUsers(await this.crewMemberIds(s.crewId));
     const rows = await db.select().from(picks).where(eq(picks.sessionId, s.id)).orderBy(asc(picks.id));
-    const views = await Promise.all(rows.map((p) => this.pickView(p, members)));
+    const photosById = await this.photosForPicks(rows.map((p) => p.id));
+    const views = await Promise.all(rows.map((p) => this.pickView(p, members, photosById.get(p.id) ?? [])));
     return { ...s, crew, members, picks: views };
   }
 
   // ----- picks -----
-  async pickView(p: Pick, members?: PublicUser[]): Promise<PickView> {
+  /** Photos of one pick, position order. */
+  async photosForPick(pickId: number): Promise<PickPhoto[]> {
+    const db = await getDb();
+    return db.select().from(pickPhotos).where(eq(pickPhotos.pickId, pickId)).orderBy(asc(pickPhotos.position), asc(pickPhotos.id));
+  }
+  /** Photos of many picks in one query, grouped by pick id (position order within a pick). */
+  async photosForPicks(pickIds: number[]): Promise<Map<number, PickPhoto[]>> {
+    const out = new Map<number, PickPhoto[]>();
+    if (pickIds.length === 0) return out;
+    const db = await getDb();
+    const rows = await db
+      .select()
+      .from(pickPhotos)
+      .where(inArray(pickPhotos.pickId, pickIds))
+      .orderBy(asc(pickPhotos.pickId), asc(pickPhotos.position), asc(pickPhotos.id));
+    for (const r of rows) {
+      const list = out.get(r.pickId);
+      if (list) list.push(r);
+      else out.set(r.pickId, [r]);
+    }
+    return out;
+  }
+  async getPhoto(photoId: number): Promise<PickPhoto | undefined> {
+    if (!Number.isInteger(photoId)) return undefined;
+    const db = await getDb();
+    const [row] = await db.select().from(pickPhotos).where(eq(pickPhotos.id, photoId)).limit(1);
+    return row;
+  }
+
+  /**
+   * PickView = picks row + photos[] + aggregates computed from the photo rows (items merged/deduped, palette merged,
+   * status pending > ready > failed; see server/aggregate.ts). `note` is the owner's text, else the first ready
+   * photo's summary. `photoPath` is the cover (position 0). Pass `photos` to avoid a query per pick in list views.
+   */
+  async pickView(p: Pick, members?: PublicUser[], photos?: PickPhoto[]): Promise<PickView> {
     const db = await getDb();
     const user = members?.find((m) => m.id === p.userId) ?? (await this.getUsers([p.userId]))[0];
     const rx = await db.select().from(reactions).where(eq(reactions.pickId, p.id)).orderBy(asc(reactions.id));
     const rxUsers = await this.getUsers(Array.from(new Set(rx.map((r) => r.userId))));
     const reactionViews: ReactionView[] = rx.map((r) => ({ ...r, user: rxUsers.find((u) => u.id === r.userId)! }));
+    const photoRows = photos ?? (await this.photosForPick(p.id));
+    // Legacy safety net: a pick without photo rows (back-fill not run yet) behaves like before from its own columns.
+    const agg =
+      photoRows.length > 0
+        ? aggregatePhotos(photoRows)
+        : {
+            items: safeJson<GarmentItem[]>(p.items, []),
+            palette: safeJson<string[]>(p.palette, []),
+            analysisStatus: p.analysisStatus,
+            analysisError: p.analysisError,
+            analyzedAt: p.analyzedAt,
+            summary: null,
+            coverPath: p.photoPath,
+          };
+    const photoViews: PickPhotoView[] = photoRows.map((ph) => ({
+      id: ph.id,
+      url: ph.path,
+      position: ph.position,
+      analysisStatus: ph.analysisStatus,
+      analysisError: ph.analysisError ?? null,
+      itemCount: Array.isArray(ph.items) ? ph.items.length : 0,
+    }));
     return {
       ...p,
-      palette: safeJson<string[]>(p.palette, []),
+      photoPath: agg.coverPath ?? p.photoPath,
+      note: p.note || agg.summary || null,
+      palette: agg.palette,
       // Read-time decoration, so stored picks never need re-processing:
       //   1. department hint from the pick OWNER's shopFor (else the garment's `fit`) → shoppingQuery +
       //      hinted Compare prices / Amazon links (server/prices.ts applyShoppingHints)
       //   2. affiliate wrapping (server/affiliate.ts), after the urls are final.
-      items: wrapItems(applyShoppingHints(safeJson<GarmentItem[]>(p.items, []), user)),
+      items: wrapItems(applyShoppingHints(agg.items, user)),
+      analysisStatus: agg.analysisStatus,
+      analysisError: agg.analysisError,
+      analyzedAt: agg.analyzedAt,
       user,
       reactions: reactionViews,
-      analysisFailed: p.analysisStatus === "failed",
+      analysisFailed: agg.analysisStatus === "failed",
+      photos: photoViews,
     };
   }
   async getPickForUser(sessionId: number, userId: number): Promise<Pick | undefined> {
@@ -266,94 +334,187 @@ export class DatabaseStorage {
     const [row] = await db.select().from(picks).where(eq(picks.id, id)).limit(1);
     return row;
   }
+  /**
+   * Create (or, for the same user+session, replace) a pick with 1..N photos. Re-posting deletes the previous
+   * photos and reactions; the caller removes the old files. Photos start "pending" (analysed in the background)
+   * unless `analysisStatus` says otherwise. Returns the row and the new photo rows (position order).
+   */
   async upsertPick(data: {
     sessionId: number;
     userId: number;
-    photoPath: string;
+    photoPaths: string[];
     note?: string | null;
-    palette: string[];
-    items: GarmentItem[];
-    /** Defaults to "ready" (caller already has the analysis). The upload route passes "pending" and analyses later. */
+    /** Defaults to "pending". Tests/legacy callers may pass "ready" with items/palette for every photo. */
     analysisStatus?: AnalysisStatus;
-  }): Promise<Pick> {
+    palette?: string[];
+    items?: GarmentItem[];
+  }): Promise<{ pick: Pick; photos: PickPhoto[]; previousPhotoPaths: string[] }> {
     const db = await getDb();
+    if (data.photoPaths.length === 0) throw new Error("upsertPick needs at least one photo");
     const existing = await this.getPickForUser(data.sessionId, data.userId);
-    const status = data.analysisStatus ?? "ready";
+    const status = data.analysisStatus ?? "pending";
+    const now = new Date();
     const values = {
-      photoPath: data.photoPath,
+      photoPath: data.photoPaths[0],
       note: data.note ?? null,
-      palette: JSON.stringify(data.palette),
-      items: JSON.stringify(data.items),
+      palette: JSON.stringify(data.palette ?? []),
+      items: JSON.stringify(data.items ?? []),
       locked: false,
-      createdAt: new Date().toISOString(),
+      createdAt: now.toISOString(),
       analysisStatus: status,
       analysisError: null,
-      analyzedAt: status === "ready" ? new Date() : null,
+      analyzedAt: status === "ready" ? now : null,
     };
-    if (existing) {
-      await db.delete(reactions).where(eq(reactions.pickId, existing.id));
-      const [row] = await db.update(picks).set(values).where(eq(picks.id, existing.id)).returning();
-      return row;
-    }
-    const [row] = await db.insert(picks).values({ sessionId: data.sessionId, userId: data.userId, ...values }).returning();
-    return row;
+    return db.transaction(async (tx) => {
+      let pick: Pick;
+      let previousPhotoPaths: string[] = [];
+      if (existing) {
+        const old = await tx.select({ path: pickPhotos.path }).from(pickPhotos).where(eq(pickPhotos.pickId, existing.id));
+        previousPhotoPaths = old.map((o) => o.path);
+        if (previousPhotoPaths.length === 0 && existing.photoPath) previousPhotoPaths = [existing.photoPath];
+        await tx.delete(reactions).where(eq(reactions.pickId, existing.id));
+        await tx.delete(pickPhotos).where(eq(pickPhotos.pickId, existing.id));
+        [pick] = await tx.update(picks).set(values).where(eq(picks.id, existing.id)).returning();
+      } else {
+        [pick] = await tx.insert(picks).values({ sessionId: data.sessionId, userId: data.userId, ...values }).returning();
+      }
+      const photos = await tx
+        .insert(pickPhotos)
+        .values(
+          data.photoPaths.map((path, i) => ({
+            pickId: pick.id,
+            path,
+            position: i,
+            analysisStatus: status,
+            analysisError: null,
+            items: i === 0 ? data.items ?? [] : [],
+            palette: i === 0 ? data.palette ?? [] : [],
+            summary: null,
+            analyzedAt: status === "ready" ? now : null,
+            createdAt: now,
+          })),
+        )
+        .returning();
+      photos.sort((a, b) => a.position - b.position);
+      return { pick, photos, previousPhotoPaths };
+    });
+  }
+  /** Append photos to an existing pick (positions continue after the current last). Caller enforces the max. */
+  async addPhotos(pickId: number, paths: string[]): Promise<PickPhoto[]> {
+    if (paths.length === 0) return [];
+    const db = await getDb();
+    const now = new Date();
+    return db.transaction(async (tx) => {
+      const current = await tx.select({ position: pickPhotos.position }).from(pickPhotos).where(eq(pickPhotos.pickId, pickId));
+      const start = current.length ? Math.max(...current.map((c) => c.position)) + 1 : 0;
+      const rows = await tx
+        .insert(pickPhotos)
+        .values(paths.map((path, i) => ({ pickId, path, position: start + i, analysisStatus: "pending" as const, items: [], palette: [], createdAt: now })))
+        .returning();
+      await this.recomputePickAggregates(pickId, tx);
+      return rows.sort((a, b) => a.position - b.position);
+    });
   }
   /**
-   * Mark a pick as queued for (re-)analysis. Items/palette are kept until the new result lands so the
-   * crew keeps seeing the previous pieces while a retry runs.
+   * Remove one photo, renumber the rest (0..n-1, keeping their order) and recompute the aggregates. Returns the
+   * removed row (caller deletes the file) or undefined when it does not belong to the pick. Refuses (returns
+   * { last: true }) when it is the only photo: delete the pick instead.
    */
-  async markAnalysisPending(pickId: number): Promise<Pick | undefined> {
+  async deletePhoto(pickId: number, photoId: number): Promise<{ removed?: PickPhoto; last?: boolean }> {
     const db = await getDb();
+    return db.transaction(async (tx) => {
+      const rows = await tx.select().from(pickPhotos).where(eq(pickPhotos.pickId, pickId)).orderBy(asc(pickPhotos.position), asc(pickPhotos.id));
+      const target = rows.find((r) => r.id === photoId);
+      if (!target) return {};
+      if (rows.length <= 1) return { last: true };
+      await tx.delete(pickPhotos).where(eq(pickPhotos.id, photoId));
+      const rest = rows.filter((r) => r.id !== photoId);
+      for (let i = 0; i < rest.length; i++) {
+        if (rest[i].position !== i) await tx.update(pickPhotos).set({ position: i }).where(eq(pickPhotos.id, rest[i].id));
+      }
+      await this.recomputePickAggregates(pickId, tx);
+      return { removed: target };
+    });
+  }
+  /**
+   * Mark photos as queued for (re-)analysis and refresh the pick aggregate. Items/palette on the photo are kept
+   * until the new result lands so the crew keeps seeing the previous pieces while a retry runs.
+   */
+  async markPhotosPending(pickId: number, photoIds: number[]): Promise<PickPhoto[]> {
+    if (photoIds.length === 0) return [];
+    const db = await getDb();
+    return db.transaction(async (tx) => {
+      const rows = await tx
+        .update(pickPhotos)
+        .set({ analysisStatus: "pending", analysisError: null })
+        .where(and(eq(pickPhotos.pickId, pickId), inArray(pickPhotos.id, photoIds)))
+        .returning();
+      await this.recomputePickAggregates(pickId, tx);
+      return rows.sort((a, b) => a.position - b.position);
+    });
+  }
+  /**
+   * Store a finished analysis of ONE photo and recompute the pick in the same transaction. Guarded by `path`: if
+   * the row has moved on (photo deleted / replaced) the stale result is dropped and undefined is returned.
+   */
+  async completePhotoAnalysis(photoId: number, path: string, result: { palette: string[]; items: GarmentItem[]; summary?: string | null }): Promise<PickPhoto | undefined> {
+    const db = await getDb();
+    return db.transaction(async (tx) => {
+      const [row] = await tx
+        .update(pickPhotos)
+        .set({ palette: result.palette, items: result.items, summary: result.summary?.trim() || null, analysisStatus: "ready", analysisError: null, analyzedAt: new Date() })
+        .where(and(eq(pickPhotos.id, photoId), eq(pickPhotos.path, path)))
+        .returning();
+      if (!row) return undefined;
+      await this.recomputePickAggregates(row.pickId, tx);
+      return row;
+    });
+  }
+  /** Record a failed analysis of one photo (same `path` guard). `error` must already be short and secret-free. */
+  async failPhotoAnalysis(photoId: number, path: string, error: string): Promise<PickPhoto | undefined> {
+    const db = await getDb();
+    return db.transaction(async (tx) => {
+      const [row] = await tx
+        .update(pickPhotos)
+        .set({ analysisStatus: "failed", analysisError: error.slice(0, 300), analyzedAt: new Date() })
+        .where(and(eq(pickPhotos.id, photoId), eq(pickPhotos.path, path)))
+        .returning();
+      if (!row) return undefined;
+      await this.recomputePickAggregates(row.pickId, tx);
+      return row;
+    });
+  }
+  /**
+   * Recompute the aggregate columns of a pick from its photo rows (items/palette/status/error/analyzedAt and the
+   * cover photo_path). Runs inside the caller's transaction when `tx` is given. No-op for a pick without photos.
+   */
+  async recomputePickAggregates(pickId: number, tx?: Db): Promise<Pick | undefined> {
+    const db = tx ?? (await getDb());
+    const photos = await db.select().from(pickPhotos).where(eq(pickPhotos.pickId, pickId)).orderBy(asc(pickPhotos.position), asc(pickPhotos.id));
+    if (photos.length === 0) return undefined;
+    const agg = aggregatePhotos(photos);
     const [row] = await db
       .update(picks)
-      .set({ analysisStatus: "pending", analysisError: null })
+      .set({
+        photoPath: agg.coverPath ?? undefined,
+        items: JSON.stringify(agg.items),
+        palette: JSON.stringify(agg.palette),
+        analysisStatus: agg.analysisStatus,
+        analysisError: agg.analysisError,
+        analyzedAt: agg.analyzedAt,
+      })
       .where(eq(picks.id, pickId))
       .returning();
     return row;
   }
-  /**
-   * Store a finished analysis. Guarded by `photoPath`: if the owner re-posted a different photo while this
-   * one was being analysed, the stale result is dropped (returns undefined) instead of overwriting the new pick.
-   */
-  async completeAnalysis(
-    pickId: number,
-    photoPath: string,
-    result: { palette: string[]; items: GarmentItem[]; note?: string | null },
-  ): Promise<Pick | undefined> {
-    const db = await getDb();
-    const set: Partial<typeof picks.$inferInsert> = {
-      palette: JSON.stringify(result.palette),
-      items: JSON.stringify(result.items),
-      analysisStatus: "ready",
-      analysisError: null,
-      analyzedAt: new Date(),
-    };
-    if (result.note !== undefined) set.note = result.note;
-    const [row] = await db
-      .update(picks)
-      .set(set)
-      .where(and(eq(picks.id, pickId), eq(picks.photoPath, photoPath)))
-      .returning();
-    return row;
-  }
-  /** Record a failed analysis (same photoPath guard as completeAnalysis). `error` must already be short and secret-free. */
-  async failAnalysis(pickId: number, photoPath: string, error: string): Promise<Pick | undefined> {
-    const db = await getDb();
-    const [row] = await db
-      .update(picks)
-      .set({ analysisStatus: "failed", analysisError: error.slice(0, 300), analyzedAt: new Date() })
-      .where(and(eq(picks.id, pickId), eq(picks.photoPath, photoPath)))
-      .returning();
-    return row;
-  }
-  /** Picks still "pending" whose created_at (ISO text) is older than `before`; used by startup recovery. */
-  async stalePendingPicks(before: Date): Promise<Pick[]> {
+  /** Photos still "pending" created before `before`; used by startup recovery and the periodic sweep. */
+  async stalePendingPhotos(before: Date): Promise<PickPhoto[]> {
     const db = await getDb();
     return db
       .select()
-      .from(picks)
-      .where(and(eq(picks.analysisStatus, "pending"), lt(picks.createdAt, before.toISOString())))
-      .orderBy(asc(picks.id))
+      .from(pickPhotos)
+      .where(and(eq(pickPhotos.analysisStatus, "pending"), lt(pickPhotos.createdAt, before)))
+      .orderBy(asc(pickPhotos.id))
       .limit(200);
   }
   async setLocked(pickId: number, locked: boolean): Promise<Pick> {
@@ -361,10 +522,19 @@ export class DatabaseStorage {
     const [row] = await db.update(picks).set({ locked }).where(eq(picks.id, pickId)).returning();
     return row;
   }
-  async deletePick(pickId: number): Promise<void> {
+  /** Delete a pick with its reactions and photo rows; returns the stored photo paths so the caller can remove the files. */
+  async deletePick(pickId: number): Promise<string[]> {
     const db = await getDb();
-    await db.delete(reactions).where(eq(reactions.pickId, pickId));
-    await db.delete(picks).where(eq(picks.id, pickId));
+    const photos = await this.photosForPick(pickId);
+    const [pick] = await db.select({ photoPath: picks.photoPath }).from(picks).where(eq(picks.id, pickId)).limit(1);
+    await db.transaction(async (tx) => {
+      await tx.delete(reactions).where(eq(reactions.pickId, pickId));
+      await tx.delete(pickPhotos).where(eq(pickPhotos.pickId, pickId)); // explicit, in addition to the FK cascade
+      await tx.delete(picks).where(eq(picks.id, pickId));
+    });
+    const paths = new Set(photos.map((p) => p.path));
+    if (pick?.photoPath) paths.add(pick.photoPath);
+    return Array.from(paths);
   }
   async picksForUser(userId: number): Promise<(PickView & { session: Session; crew: Crew })[]> {
     const db = await getDb();
@@ -374,12 +544,13 @@ export class DatabaseStorage {
     const sessionById = new Map(sessionRows.map((s) => [s.id, s]));
     const crewRows = await db.select().from(crews).where(inArray(crews.id, Array.from(new Set(sessionRows.map((s) => s.crewId)))));
     const crewById = new Map(crewRows.map((c) => [c.id, c]));
+    const photosById = await this.photosForPicks(rows.map((p) => p.id));
     const out: (PickView & { session: Session; crew: Crew })[] = [];
     for (const p of rows) {
       const session = sessionById.get(p.sessionId);
       const crew = session ? crewById.get(session.crewId) : undefined;
       if (!session || !crew) continue;
-      out.push({ ...(await this.pickView(p)), session, crew });
+      out.push({ ...(await this.pickView(p, undefined, photosById.get(p.id) ?? [])), session, crew });
     }
     return out;
   }

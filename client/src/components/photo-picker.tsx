@@ -11,23 +11,36 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
  *
  * HEIC/HEIF (or an empty `file.type`) is passed through untouched; the server sniffs the bytes
  * and decides. Callers surface a friendly message on a 400.
+ *
+ * The library input accepts several files at once (`multiple`); the camera input is always a
+ * single shot. Either way the caller receives `File[]`, capped at `max` when given.
  */
 export function PhotoSourcePicker({
-  onFile,
+  onFiles,
   children,
   align = "center",
   side = "bottom",
   className,
   disabled = false,
+  multiple = true,
+  max,
+  title = "Add a photo",
   testIdPrefix = "photo",
 }: {
-  onFile: (f: File | undefined) => void;
+  /** Called with the chosen files (never empty). Camera gives one; library may give several. */
+  onFiles: (files: File[]) => void;
   /** The tappable surface (card, button). Rendered via Radix `asChild`, so pass a single element. */
   children: ReactNode;
   align?: "start" | "center" | "end";
   side?: "top" | "bottom";
   className?: string;
   disabled?: boolean;
+  /** Allow multi-select from the library (default true). The camera input is always single. */
+  multiple?: boolean;
+  /** Hard cap on how many files a single choice may return (extra files are dropped). */
+  max?: number;
+  /** Sheet heading. */
+  title?: string;
   /** `input-${prefix}` stays on the camera input for back-compat; the library input is `input-${prefix}-library`. */
   testIdPrefix?: string;
 }) {
@@ -36,10 +49,11 @@ export function PhotoSourcePicker({
   const libraryRef = useRef<HTMLInputElement>(null);
 
   function handleChange(e: ChangeEvent<HTMLInputElement>) {
-    const f = e.target.files?.[0];
+    let files = Array.from(e.target.files ?? []);
     // Reset so picking the same file twice still fires onChange.
     e.target.value = "";
-    onFile(f);
+    if (typeof max === "number") files = files.slice(0, Math.max(0, max));
+    if (files.length) onFiles(files);
   }
 
   function pick(ref: typeof cameraRef) {
@@ -65,6 +79,7 @@ export function PhotoSourcePicker({
         ref={libraryRef}
         type="file"
         accept="image/*"
+        multiple={multiple && (max === undefined || max > 1)}
         className="hidden"
         onChange={handleChange}
         tabIndex={-1}
@@ -83,7 +98,7 @@ export function PhotoSourcePicker({
           className={cn("w-[min(18rem,calc(100vw-2rem))] rounded-2xl border-card-border p-1.5 shadow-lg", className)}
           data-testid="sheet-photo-source"
         >
-          <p className="px-2.5 pb-1 pt-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Add a photo</p>
+          <p className="px-2.5 pb-1 pt-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{title}</p>
           <button
             type="button"
             onClick={() => pick(cameraRef)}
@@ -109,7 +124,7 @@ export function PhotoSourcePicker({
             </span>
             <span className="min-w-0">
               <span className="block">Choose from library</span>
-              <span className="block text-xs font-normal text-muted-foreground">Camera roll, screenshots, Files</span>
+              <span className="block text-xs font-normal text-muted-foreground">{multiple && (max === undefined || max > 1) ? "Pick one or several" : "Camera roll, screenshots, Files"}</span>
             </span>
           </button>
         </PopoverContent>
