@@ -5,7 +5,7 @@ import { z } from "zod";
 import { sql } from "drizzle-orm";
 import { storage, toPublic, verifyPin, getDb } from "./storage";
 import { files, removeUpload } from "./files";
-import { analyzeOutfit } from "./vision";
+import { enqueueAnalysis, recoverStuckAnalyses, startAnalysisSweeper } from "./analysis";
 import { lookupOffers, buildShoppingQuery } from "./prices";
 import { presentOffers } from "./affiliate";
 import { registerFeedbackRoutes, isAdmin } from "./feedback";
@@ -76,6 +76,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Boot order: database (creates tables) then file store (creates bucket if needed).
   await getDb();
   await files.init(app);
+  // Background outfit analysis: re-queue picks left "pending" by a previous process, then keep sweeping.
+  recoverStuckAnalyses().catch((err) => console.error("[analysis] startup recovery failed", err));
+  startAnalysisSweeper();
+
+  // Polled resources must never be served from an HTTP cache.
+  const noStore = (_req: Request, res: Response, next: NextFunction) => {
+    res.setHeader("Cache-Control", "no-store");
+    next();
+  };
 
   // ---------- health (keep-alive pinger / Render health check) ----------
   app.get("/api/health", async (_req, res) => {
@@ -155,7 +164,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // ---------- days (auto-created sessions) ----------
-  app.get("/api/crews/:id/day/:date", requireAuth, async (req, res) => {
+  app.get("/api/crews/:id/day/:date", requireAuth, noStore, async (req, res) => {
     const crew = await storage.getCrew(Number(req.params.id));
     const user = (req as AuthedRequest).user;
     if (!crew || !(await storage.isMember(crew.id, user.id))) return res.status(404).json({ message: "Crew not found" });
@@ -193,7 +202,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(await storage.sessionView(s));
   });
 
-  app.get("/api/sessions/:id", requireAuth, async (req, res) => {
+  app.get("/api/sessions/:id", requireAuth, noStore, async (req, res) => {
     const s = await storage.getSession(Number(req.params.id));
     if (!s || !(await storage.isMember(s.crewId, (req as AuthedRequest).user.id))) return res.status(404).json({ message: "Session not found" });
     res.json(await storage.sessionView(s));
@@ -214,34 +223,65 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     next();
   };
 
-  app.post("/api/sessions/:id/picks", requireAuth, requireSessionMember, uploadPhoto, async (req, res) => {
+  /**
+   * Post an outfit. Responds 201 as soon as the photo is stored; the Gemini analysis runs in the background
+   * (server/analysis.ts) and the PickView comes back with analysisStatus "pending", items [] and palette [].
+   * Poll GET /api/picks/:id until analysisStatus is "ready" | "failed".
+   */
+  app.post("/api/sessions/:id/picks", requireAuth, requireSessionMember, uploadPhoto, noStore, async (req, res) => {
     const s = (await storage.getSession(Number(req.params.id)))!;
     const user = (req as AuthedRequest).user;
     if (!req.file) return res.status(400).json({ message: "Add a photo of the outfit" });
     const kind = sniffImage(req.file.buffer);
     if (!kind) return res.status(400).json({ message: "That file isn't a photo we can read (JPG, PNG, HEIC or WebP)" });
-    const note = typeof req.body.note === "string" ? req.body.note.slice(0, 200) : null;
+    const note = typeof req.body.note === "string" ? req.body.note.slice(0, 200).trim() : null;
 
-    let analysis = { palette: [] as string[], items: [] as any[], summary: "" };
-    let analysisFailed = false;
-    try {
-      analysis = await analyzeOutfit(req.file.buffer, kind.mime);
-    } catch (err) {
-      analysisFailed = true;
-      console.error("vision failed", err);
-    }
     const previous = await storage.getPickForUser(s.id, user.id);
     const photoPath = await files.put(req.file.buffer, kind.ext, kind.mime);
     const pick = await storage.upsertPick({
       sessionId: s.id,
       userId: user.id,
       photoPath,
-      note: note || analysis.summary || null,
-      palette: analysis.palette,
-      items: analysis.items,
+      note: note || null,
+      palette: [],
+      items: [],
+      analysisStatus: "pending",
     });
     if (previous && previous.photoPath !== pick.photoPath) void removeUpload(previous.photoPath);
-    res.json({ ...(await storage.pickView(pick)), analysisFailed });
+    res.status(201).json(await storage.pickView(pick));
+    // Fire-and-forget: enqueueAnalysis never throws, and job errors are recorded on the row.
+    try {
+      enqueueAnalysis({ pickId: pick.id, photoPath, buffer: req.file.buffer, mime: kind.mime, reason: "upload" });
+    } catch (err) {
+      console.error("[analysis] enqueue failed", err);
+    }
+  });
+
+  // Poll target for the background analysis (any crew member). Same PickView shape as the session view.
+  app.get("/api/picks/:id", requireAuth, noStore, async (req, res) => {
+    const pick = await storage.getPick(Number(req.params.id));
+    const user = (req as AuthedRequest).user;
+    if (!pick) return res.status(404).json({ message: "Pick not found" });
+    const s = await storage.getSession(pick.sessionId);
+    if (!s || !(await storage.isMember(s.crewId, user.id))) return res.status(403).json({ message: "Not your crew" });
+    res.json(await storage.pickView(pick));
+  });
+
+  // Owner-only: re-run the outfit analysis (after a failure, or to refresh). Returns the PickView with status "pending".
+  app.post("/api/picks/:id/analyze", requireAuth, noStore, async (req, res) => {
+    const pick = await storage.getPick(Number(req.params.id));
+    const user = (req as AuthedRequest).user;
+    if (!pick) return res.status(404).json({ message: "Pick not found" });
+    if (pick.userId !== user.id) return res.status(403).json({ message: "Only the owner can re-run the analysis" });
+    if (pick.analysisStatus === "pending") return res.status(202).json(await storage.pickView(pick)); // already queued
+    if (limited(`analyze:${user.id}`, 10, 60 * 60 * 1000)) return res.status(429).json({ message: "Too many retries. Try again in a bit." });
+    const updated = (await storage.markAnalysisPending(pick.id)) ?? pick;
+    res.json(await storage.pickView(updated));
+    try {
+      enqueueAnalysis({ pickId: pick.id, photoPath: updated.photoPath, reason: "retry" });
+    } catch (err) {
+      console.error("[analysis] enqueue failed", err);
+    }
   });
 
   app.patch("/api/picks/:id", requireAuth, async (req, res) => {

@@ -1,6 +1,6 @@
-import { useState } from "react";
-import { useQuery, useMutation } from "@tanstack/react-query";
-import { Camera, Lock, Unlock, ExternalLink, Sparkles, Trash2, Send, Tag, ChevronDown, ShoppingBag } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { useQuery, useQueries, useMutation } from "@tanstack/react-query";
+import { Camera, Lock, Unlock, ExternalLink, Sparkles, Trash2, Send, Tag, ChevronDown, ShoppingBag, RefreshCw } from "lucide-react";
 import type { SessionView, PickView, PublicUser, GarmentItem } from "@shared/schema";
 import { Page, Avatar, Swatches } from "@/components/shell";
 import { Button } from "@/components/ui/button";
@@ -9,13 +9,15 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Drawer, DrawerContent, DrawerHeader, DrawerTitle } from "@/components/ui/drawer";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { apiJson, apiRequest, assetUrl, errorStatus, queryClient } from "@/lib/queryClient";
+import { apiJson, apiUpload, assetUrl, errorStatus, queryClient } from "@/lib/queryClient";
 import { PhotoSourcePicker, UNSUPPORTED_PHOTO_MESSAGE } from "@/components/photo-picker";
 import { useAuth } from "@/lib/auth";
 import { useToast } from "@/hooks/use-toast";
 import { formatDate, matchScore, type MatchLevel } from "@/lib/color";
 import { cn } from "@/lib/utils";
 import { formatPrice, isDirect, isLowestPrice, offerSourceLabel, pickHighlightOffer, retailerHost, type PriceOffer } from "@/lib/offers";
+import { downscaleForUpload } from "@/lib/image";
+import { ANALYSIS_POLL_MS, analysisStatusOf, type PickWithAnalysis } from "@/lib/analysis";
 
 const EMOJIS = ["🔥", "😍", "👯‍♀️", "✅"];
 
@@ -41,36 +43,187 @@ export function SessionSkeleton() {
   );
 }
 
+// ---------- async analysis: poll GET /api/picks/:id while pending ----------
+/**
+ * For every pick whose analysis is still pending, poll GET /api/picks/:id every 2.5 s and overlay
+ * the fresher analysis fields (status, items, palette, error) on the session's copy. Everything
+ * else (reactions, locked) keeps coming from the session so we never show stale social state.
+ * When a poll settles (ready/failed) we call `onSettled` once so the caller can refetch the session
+ * and the match meter catches up.
+ */
+function useLivePicks(picks: PickView[], sessionUpdatedAt: number, onSettled: (pick: PickWithAnalysis) => void): PickWithAnalysis[] {
+  const results = useQueries({
+    queries: picks.map((p) => ({
+      queryKey: ["/api/picks", p.id] as const,
+      enabled: analysisStatusOf(p) === "pending",
+      staleTime: 0,
+      refetchInterval: (query: { state: { data?: unknown } }) =>
+        analysisStatusOf(query.state.data as PickWithAnalysis | undefined) === "pending" ? ANALYSIS_POLL_MS : false,
+      refetchOnWindowFocus: false,
+    })),
+  });
+
+  const live: PickWithAnalysis[] = picks.map((p, i) => {
+    const r = results[i];
+    const d = r?.data as PickWithAnalysis | undefined;
+    // Only trust the polled copy when it's newer than the session payload we're rendering from.
+    if (!d || d.id !== p.id || r.dataUpdatedAt <= sessionUpdatedAt) return p;
+    return { ...p, analysisStatus: d.analysisStatus, analysisError: d.analysisError, items: d.items ?? p.items, palette: d.palette ?? p.palette };
+  });
+
+  // Fire onSettled exactly once per (pick, poll result) transition from pending → ready/failed.
+  const notified = useRef(new Set<string>());
+  const settledKeys = picks
+    .map((p, i) => {
+      const r = results[i];
+      const d = r?.data as PickWithAnalysis | undefined;
+      if (!d || analysisStatusOf(p) !== "pending" || analysisStatusOf(d) === "pending" || r.dataUpdatedAt <= sessionUpdatedAt) return null;
+      return `${p.id}:${r.dataUpdatedAt}`;
+    })
+    .filter((k): k is string => !!k);
+  const settledSig = settledKeys.join("|");
+  useEffect(() => {
+    if (!settledSig) return;
+    settledKeys.forEach((k) => {
+      if (notified.current.has(k)) return;
+      notified.current.add(k);
+      const id = Number(k.split(":")[0]);
+      const pick = live.find((p) => p.id === id);
+      if (pick) onSettled(pick);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settledSig]);
+
+  return live;
+}
+
+/** POST /api/picks/:id/analyze (owner only) — flips the pick back to pending so polling resumes. */
+function useRetryAnalysis(queryKey: unknown[], onDone: () => void) {
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (pickId: number) => apiJson<PickWithAnalysis>("POST", `/api/picks/${pickId}/analyze`),
+    onMutate: (pickId) => {
+      // Optimistically mark pending in the session so the shimmer shows and the poller enables immediately.
+      const mark = (old: SessionView | undefined) =>
+        old ? { ...old, picks: old.picks.map((p) => (p.id === pickId ? ({ ...p, analysisStatus: "pending", analysisError: null } as PickWithAnalysis) : p)) } : old;
+      queryClient.setQueryData<SessionView>(queryKey, mark);
+      queryClient.removeQueries({ queryKey: ["/api/picks", pickId], exact: true });
+    },
+    onSuccess: () => onDone(),
+    onError: (e: Error) => toast({ title: e.message || "Couldn't retry right now", variant: "destructive" }),
+  });
+}
+
 /** The heart of the app: one day's picks for one crew. Used by the crew page (day strip) and deep links. */
 export function SessionBody({ session: s, queryKey }: { session: SessionView; queryKey: unknown[] }) {
   const { user } = useAuth();
+  const { toast } = useToast();
   const [openPick, setOpenPick] = useState<number | null>(null);
   const [uploading, setUploading] = useState(false);
-  if (!user) return null;
+  // Optimistic "Post my pick" slot: local preview + upload progress until the 201 lands.
+  const [local, setLocal] = useState<{ previewUrl: string; progress: number; phase: "preparing" | "uploading" } | null>(null);
+  // After the 201, keep the local preview under the real photo until the server copy has loaded.
+  const [recentPreview, setRecentPreview] = useState<{ pickId: number; url: string } | null>(null);
+  const userId = user?.id;
 
-  const myPick = s.picks.find((p) => p.userId === user.id);
-  const match = s.picks.length >= 2 && s.picks.filter((p) => p.palette.length).length < 2
-    ? { score: 0, level: "waiting" as const, label: "Colors not read", detail: "Repost a clearer, well-lit photo so we can compare looks." }
-    : matchScore(s.picks.map((p) => p.palette));
-  const lockedCount = s.picks.filter((p) => p.locked).length;
-  const selected = s.picks.find((p) => p.id === openPick) ?? null;
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey });
     queryClient.invalidateQueries({ queryKey: ["/api/sessions", s.id] });
     queryClient.invalidateQueries({ queryKey: ["/api/crews"] });
   };
 
+  const sessionUpdatedAt = queryClient.getQueryState(queryKey)?.dataUpdatedAt ?? 0;
+  const picks = useLivePicks(s.picks, sessionUpdatedAt, (pick) => {
+    invalidate();
+    if (pick.userId === userId) {
+      queryClient.invalidateQueries({ queryKey: ["/api/closet"] });
+      if (analysisStatusOf(pick) === "ready") {
+        toast({
+          title: pick.items.length ? `Found ${pick.items.length} ${pick.items.length === 1 ? "piece" : "pieces"} to shop` : "Pick posted",
+          description: pick.items.length ? "Tap your pick to see where to buy each one." : "We couldn't make out the pieces; a clearer, well-lit photo works best.",
+        });
+      }
+    }
+  });
+  const retry = useRetryAnalysis(queryKey, invalidate);
+
+  const post = useMutation({
+    mutationFn: async ({ prepared, note }: PostInput) => {
+      const file = await prepared;
+      setLocal((l) => (l ? { ...l, phase: "uploading" } : l));
+      const fd = new FormData();
+      fd.append("photo", file);
+      if (note) fd.append("note", note);
+      return apiUpload<PickWithAnalysis>(`/api/sessions/${s.id}/picks`, fd, (f) => setLocal((l) => (l ? { ...l, progress: f } : l)));
+    },
+    onSuccess: (p, vars) => {
+      // Drop the new pick straight into the cached session so the slot never flashes back to "Post my pick".
+      const place = (old: SessionView | undefined) => (old ? { ...old, picks: [...old.picks.filter((x) => x.userId !== p.userId), p] } : old);
+      queryClient.setQueryData<SessionView>(queryKey, place);
+      setRecentPreview({ pickId: p.id, url: vars.previewUrl });
+      setLocal(null);
+      invalidate();
+      queryClient.invalidateQueries({ queryKey: ["/api/closet"] });
+      if (analysisStatusOf(p) === "ready") {
+        // Legacy synchronous server: analysis already done.
+        toast({ title: "Pick posted", description: p.items.length ? `Found ${p.items.length} pieces to shop.` : "Your crew can see it. We couldn't make out the pieces; a clearer, well-lit photo works best." });
+      }
+    },
+    onError: (e: Error, vars) => {
+      setLocal(null);
+      URL.revokeObjectURL(vars.previewUrl);
+      // 400 from the picks route means the bytes weren't a photo we can decode (e.g. an odd HEIF container).
+      // Size limits come back with their own message, so only translate the format case.
+      const friendly = errorStatus(e) === 400 && !/large|size|limit/i.test(e.message);
+      toast({ title: friendly ? UNSUPPORTED_PHOTO_MESSAGE : e.message, description: "Your pick wasn't posted. Try again.", variant: "destructive" });
+    },
+  });
+
+  if (!user) return null;
+
+  const myPick = picks.find((p) => p.userId === user.id);
+  const pendingCount = picks.filter((p) => analysisStatusOf(p) === "pending").length;
+  const match = pendingCount > 0
+    ? { score: 0, level: "waiting" as const, label: "Reading outfits…", detail: pendingCount === 1 ? "Pulling the colors from a new pick. The score lands in a moment." : "Pulling the colors from new picks. The score lands in a moment." }
+    : picks.length >= 2 && picks.filter((p) => p.palette.length).length < 2
+      ? { score: 0, level: "waiting" as const, label: "Colors not read", detail: "Repost a clearer, well-lit photo so we can compare looks." }
+      : matchScore(picks.map((p) => p.palette));
+  const lockedCount = picks.filter((p) => p.locked).length;
+  const selected = picks.find((p) => p.id === openPick) ?? null;
+
+  function startPost(input: PostInput) {
+    setUploading(false);
+    setLocal({ previewUrl: input.previewUrl, progress: 0, phase: "preparing" });
+    post.mutate(input);
+  }
+
   return (
     <>
       <VibeLine session={s} onSaved={invalidate} />
-      <MatchMeter level={match.level} label={match.label} detail={match.detail} picked={s.picks.length} total={s.members.length} locked={lockedCount} />
+      <MatchMeter level={match.level} label={match.label} detail={match.detail} picked={picks.length + (local && !myPick ? 1 : 0)} total={s.members.length} locked={lockedCount} pending={pendingCount > 0} />
 
       <div className="mt-4 grid grid-cols-2 gap-3">
         {s.members.map((m) => {
-          const p = s.picks.find((x) => x.userId === m.id);
+          const p = picks.find((x) => x.userId === m.id);
           const mine = m.id === user.id;
+          if (mine && local) return <UploadingCard key={m.id} user={m} previewUrl={local.previewUrl} progress={local.progress} phase={local.phase} />;
           if (!p) return <EmptyPick key={m.id} user={m} mine={mine} onAdd={() => setUploading(true)} />;
-          return <PickCard key={m.id} pick={p} mine={mine} onOpen={() => setOpenPick(p.id)} />;
+          return (
+            <PickCard
+              key={m.id}
+              pick={p}
+              mine={mine}
+              onOpen={() => setOpenPick(p.id)}
+              localPreview={recentPreview?.pickId === p.id ? recentPreview.url : undefined}
+              onPhotoLoaded={() => {
+                // Let the server photo finish its fade before pulling the local preview from underneath.
+                const rp = recentPreview;
+                if (rp?.pickId === p.id) window.setTimeout(() => { URL.revokeObjectURL(rp.url); setRecentPreview((cur) => (cur?.pickId === rp.pickId ? null : cur)); }, 400);
+              }}
+              onRetry={mine ? () => retry.mutate(p.id) : undefined}
+              retrying={retry.isPending && retry.variables === p.id}
+            />
+          );
         })}
       </div>
       {s.members.length === 1 && (
@@ -79,15 +232,15 @@ export function SessionBody({ session: s, queryKey }: { session: SessionView; qu
 
       {myPick && (
         <div className="mt-5 flex gap-2">
-          <Button variant="outline" className="flex-1" onClick={() => setUploading(true)} data-testid="button-change-pick">
+          <Button variant="outline" className="flex-1" onClick={() => setUploading(true)} disabled={!!local} data-testid="button-change-pick">
             <Camera className="h-4 w-4" /> Change my pick
           </Button>
           <LockButton pick={myPick} onDone={invalidate} />
         </div>
       )}
 
-      <UploadDialog open={uploading} onClose={() => setUploading(false)} sessionId={s.id} hasExisting={!!myPick} onDone={invalidate} />
-      <PickDrawer pick={selected} onClose={() => setOpenPick(null)} me={user} onDone={invalidate} />
+      <UploadDialog open={uploading} onClose={() => setUploading(false)} hasExisting={!!myPick} onPost={startPost} />
+      <PickDrawer pick={selected} onClose={() => setOpenPick(null)} me={user} onDone={invalidate} onRetry={(id) => retry.mutate(id)} retrying={retry.isPending} />
     </>
   );
 }
@@ -124,17 +277,20 @@ const LEVEL_STYLE: Record<MatchLevel, string> = {
   waiting: "bg-secondary text-muted-foreground",
 };
 
-function MatchMeter({ level, label, detail, picked, total, locked }: { level: MatchLevel; label: string; detail: string; picked: number; total: number; locked: number }) {
+function MatchMeter({ level, label, detail, picked, total, locked, pending = false }: { level: MatchLevel; label: string; detail: string; picked: number; total: number; locked: number; pending?: boolean }) {
   const pct = total ? Math.round((picked / total) * 100) : 0;
   return (
-    <section className="rounded-2xl border border-card-border bg-card p-4" data-testid="card-match-meter">
+    <section className="rounded-2xl border border-card-border bg-card p-4" data-testid="card-match-meter" data-pending={pending ? "true" : undefined}>
       <div className="flex items-center justify-between gap-3">
-        <div>
+        <div className="min-w-0">
           <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Match meter</p>
-          <p className="font-display text-xl font-bold" data-testid="text-match-label">{label}</p>
+          <p className="font-display text-xl font-bold" data-testid="text-match-label">
+            {pending && <Sparkles className="mr-1.5 inline h-4 w-4 animate-pulse text-primary" aria-hidden />}
+            {label}
+          </p>
           <p className="text-sm text-muted-foreground">{detail}</p>
         </div>
-        <span className={cn("rounded-full px-3 py-1.5 text-sm font-semibold", LEVEL_STYLE[level])}>
+        <span className={cn("shrink-0 rounded-full px-3 py-1.5 text-sm font-semibold", LEVEL_STYLE[level])}>
           {picked}/{total} picked
         </span>
       </div>
@@ -175,24 +331,123 @@ function EmptyPick({ user, mine, onAdd }: { user: PublicUser; mine: boolean; onA
   );
 }
 
-function PickCard({ pick, mine, onOpen }: { pick: PickView; mine: boolean; onOpen: () => void }) {
-  const rx = pick.reactions.filter((r) => r.emoji);
+/** Shimmering stand-ins for the swatches + "N pieces" row while analysis runs. */
+function AnalysisPendingRow({ compact = false }: { compact?: boolean }) {
   return (
-    <button type="button" onClick={onOpen} className="relative overflow-hidden rounded-2xl border border-card-border bg-card text-left hover-elevate" data-testid={`card-pick-${pick.id}`}>
+    <div className="flex min-w-0 items-center justify-between gap-2" data-testid="status-analysis-pending" aria-busy="true" aria-live="polite">
+      <span className="inline-flex shrink-0 -space-x-1.5" aria-hidden>
+        {[0, 1, 2].map((i) => <span key={i} className={cn("shimmer rounded-full ring-2 ring-card", compact ? "h-3.5 w-3.5" : "h-5 w-5")} style={{ animationDelay: `${i * 120}ms` }} />)}
+      </span>
+      <span className="truncate text-xs text-muted-foreground">Reading the outfit…</span>
+    </div>
+  );
+}
+
+/** The "Post my pick" slot while the photo is still leaving the phone: local preview + thin progress bar. */
+function UploadingCard({ user, previewUrl, progress, phase }: { user: PublicUser; previewUrl: string; progress: number; phase: "preparing" | "uploading" }) {
+  const pct = Math.round(progress * 100);
+  const indeterminate = phase === "preparing" || progress <= 0;
+  return (
+    <div className="relative overflow-hidden rounded-2xl border border-card-border bg-card text-left" data-testid="card-uploading" aria-busy="true">
       <div className="aspect-[3/4] w-full bg-muted">
-        <img src={assetUrl(pick.photoPath)} alt={`${pick.user.name}'s pick`} className="h-full w-full object-cover" loading="lazy" />
+        <img src={previewUrl} alt="Your pick, uploading" className="h-full w-full object-cover" />
       </div>
       <div className="absolute left-2 top-2 flex items-center gap-1.5 rounded-full bg-background/90 py-1 pl-1 pr-2.5 text-xs font-semibold backdrop-blur">
-        <Avatar user={pick.user} size="sm" /> {mine ? "You" : pick.user.name}
+        <Avatar user={user} size="sm" /> You
       </div>
-      {pick.locked && (
-        <span className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-full bg-accent text-accent-foreground" title="Locked in"><Lock className="h-3.5 w-3.5" /></span>
+      <div className="px-2.5 py-2">
+        <div className="flex items-center justify-between gap-2 text-xs">
+          <span className="font-medium text-foreground">{phase === "preparing" ? "Preparing…" : "Uploading…"}</span>
+          {!indeterminate && <span className="tabular-nums text-muted-foreground">{pct}%</span>}
+        </div>
+        <div
+          className="mt-1.5 h-1 overflow-hidden rounded-full bg-muted"
+          role="progressbar"
+          aria-label="Upload progress"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={indeterminate ? undefined : pct}
+          data-testid="progress-upload"
+          data-phase={phase}
+        >
+          {indeterminate ? (
+            <div className="upload-indeterminate h-full w-1/3 rounded-full bg-primary" />
+          ) : (
+            <div className="h-full rounded-full bg-primary transition-[width] duration-200" style={{ width: `${pct}%` }} />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PickCard({ pick, mine, onOpen, localPreview, onPhotoLoaded, onRetry, retrying = false }: {
+  pick: PickWithAnalysis;
+  mine: boolean;
+  onOpen: () => void;
+  /** Object URL of the just-posted local file; shown under the server photo until it loads. */
+  localPreview?: string;
+  onPhotoLoaded?: () => void;
+  onRetry?: () => void;
+  retrying?: boolean;
+}) {
+  const rx = pick.reactions.filter((r) => r.emoji);
+  const status = analysisStatusOf(pick);
+  const [serverLoaded, setServerLoaded] = useState(false);
+  return (
+    <div className="relative flex flex-col" data-analysis-status={status}>
+      <button type="button" onClick={onOpen} className="relative flex w-full flex-1 flex-col overflow-hidden rounded-2xl border border-card-border bg-card text-left hover-elevate" data-testid={`card-pick-${pick.id}`}>
+        <div className="relative aspect-[3/4] w-full bg-muted">
+          {/* Local preview stays underneath until the parent clears it (after the server copy has faded in). */}
+          {localPreview && <img src={localPreview} alt="" aria-hidden className="absolute inset-0 h-full w-full object-cover" />}
+          <img
+            src={assetUrl(pick.photoPath)}
+            alt={`${pick.user.name}'s pick`}
+            className={cn("relative h-full w-full object-cover transition-opacity duration-300", localPreview && !serverLoaded ? "opacity-0" : "opacity-100")}
+            loading={localPreview ? "eager" : "lazy"}
+            onLoad={() => { setServerLoaded(true); onPhotoLoaded?.(); }}
+            onError={() => { setServerLoaded(true); onPhotoLoaded?.(); }}
+          />
+        </div>
+        <div className="absolute left-2 top-2 flex items-center gap-1.5 rounded-full bg-background/90 py-1 pl-1 pr-2.5 text-xs font-semibold backdrop-blur">
+          <Avatar user={pick.user} size="sm" /> {mine ? "You" : pick.user.name}
+        </div>
+        {pick.locked && (
+          <span className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-full bg-accent text-accent-foreground" title="Locked in"><Lock className="h-3.5 w-3.5" /></span>
+        )}
+        <div className="mt-auto flex min-h-[2.25rem] w-full items-center justify-between gap-2 px-2.5 py-2">
+          {status === "pending" ? (
+            <AnalysisPendingRow compact />
+          ) : status === "failed" ? (
+            // "fit" rather than "outfit": the 2-up card is ~153px wide and the longer copy + Retry won't fit on one line at 390px.
+            <span className="min-w-0 truncate text-[11px] text-muted-foreground" data-testid="status-analysis-failed" title={pick.analysisError ?? undefined}>
+              Couldn't read this fit{mine && onRetry ? <span className="invisible" aria-hidden> · Retry</span> : null}
+            </span>
+          ) : (
+            <>
+              <Swatches colors={pick.palette} size="sm" />
+              <span className="text-xs text-muted-foreground">{rx.length > 0 ? rx.map((r) => r.emoji).slice(0, 3).join("") : pick.items.length ? `${pick.items.length} pieces` : ""}</span>
+            </>
+          )}
+        </div>
+      </button>
+      {status === "failed" && mine && onRetry && (
+        // Sibling of the card button (not nested) so it stays valid HTML; the wrapper positions it over the
+        // right end of the footer row (.hover-elevate forces position:relative, hence the extra span).
+        <span className="absolute bottom-0 right-0 flex h-9 items-center pr-1.5">
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onRetry(); }}
+            disabled={retrying}
+            className="inline-flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-semibold text-primary hover-elevate disabled:opacity-60"
+            data-testid="button-retry-analysis"
+            aria-label="Retry reading this outfit"
+          >
+            {retrying ? <RefreshCw className="h-3 w-3 animate-spin" aria-hidden /> : <span aria-hidden>·</span>} Retry
+          </button>
+        </span>
       )}
-      <div className="flex items-center justify-between gap-2 px-2.5 py-2">
-        <Swatches colors={pick.palette} size="sm" />
-        <span className="text-xs text-muted-foreground">{rx.length > 0 ? rx.map((r) => r.emoji).slice(0, 3).join("") : pick.items.length ? `${pick.items.length} pieces` : ""}</span>
-      </div>
-    </button>
+    </div>
   );
 }
 
@@ -209,56 +464,46 @@ function LockButton({ pick, onDone }: { pick: PickView; onDone: () => void }) {
 }
 
 // ---------- upload ----------
-function UploadDialog({ open, onClose, sessionId, hasExisting, onDone }: { open: boolean; onClose: () => void; sessionId: number; hasExisting: boolean; onDone: () => void }) {
+interface PostInput {
+  /** Downscaled (or original, if the browser can't decode it) file; started the moment the photo was chosen. */
+  prepared: Promise<File>;
+  previewUrl: string;
+  note: string;
+}
+
+/**
+ * Pick a photo + optional note. Posting closes the dialog immediately and hands the work to the
+ * session body, which shows the local preview with an upload bar in the "Post my pick" slot — no
+ * modal spinner, and the user is free to navigate away. Downscaling starts as soon as the file is
+ * chosen so it's usually done by the time they tap Post.
+ */
+function UploadDialog({ open, onClose, hasExisting, onPost }: { open: boolean; onClose: () => void; hasExisting: boolean; onPost: (input: PostInput) => void }) {
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
+  const [prepared, setPrepared] = useState<Promise<File> | null>(null);
   const [note, setNote] = useState("");
-  const { toast } = useToast();
 
-  const m = useMutation({
-    mutationFn: async () => {
-      if (!file) throw new Error("Add a photo first");
-      const fd = new FormData();
-      fd.append("photo", file);
-      if (note) fd.append("note", note);
-      const res = await apiRequest("POST", `/api/sessions/${sessionId}/picks`, fd);
-      return (await res.json()) as PickView & { analysisFailed?: boolean };
-    },
-    onSuccess: (p) => {
-      onDone();
-      queryClient.invalidateQueries({ queryKey: ["/api/closet"] });
-      reset();
-      onClose();
-      toast({
-        title: "Pick posted",
-        description: p.items.length
-          ? `Found ${p.items.length} pieces to shop.`
-          : p.analysisFailed
-            ? "Your crew can see it, but we couldn't read the pieces right now. Try again later or repost."
-            : "Your crew can see it. We couldn't make out the pieces; a clearer, well-lit photo works best.",
-      });
-    },
-    onError: (e: Error) => {
-      // 400 from the picks route means the bytes weren't a photo we can decode (e.g. an odd HEIF container).
-      // Size limits come back with their own message, so only translate the format case.
-      const friendly = errorStatus(e) === 400 && !/large|size|limit/i.test(e.message);
-      toast({ title: friendly ? UNSUPPORTED_PHOTO_MESSAGE : e.message, variant: "destructive" });
-    },
-  });
-
-  function reset() {
+  function reset(revoke = true) {
+    if (revoke && preview) URL.revokeObjectURL(preview);
     setFile(null);
     setPreview(null);
+    setPrepared(null);
     setNote("");
   }
   // HEIC/HEIF or an empty type still goes through: iOS usually hands web inputs a JPEG, and when it
-  // doesn't the server sniffs the bytes and tells us. Blocking here would strand real photos.
+  // doesn't, downscaleForUpload returns the original and the server sniffs the bytes and tells us.
   function onFile(f: File | undefined) {
     if (!f) return;
+    if (preview) URL.revokeObjectURL(preview);
     setFile(f);
-    const r = new FileReader();
-    r.onload = () => setPreview(r.result as string);
-    r.readAsDataURL(f);
+    setPreview(URL.createObjectURL(f));
+    const p = downscaleForUpload(f).then((r) => r.file).catch((err) => { console.debug("[image] downscale threw, sending original", err); return f; });
+    setPrepared(p);
+  }
+  function submit() {
+    if (!file || !preview) return;
+    onPost({ prepared: prepared ?? Promise.resolve(file), previewUrl: preview, note });
+    reset(false); // the session body owns the object URL now
   }
 
   return (
@@ -287,10 +532,10 @@ function UploadDialog({ open, onClose, sessionId, hasExisting, onDone }: { open:
           </button>
         </PhotoSourcePicker>
         <Input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note (optional): 'wearing the new set'" maxLength={200} data-testid="input-note" />
-        <p className="flex items-start gap-1.5 text-xs text-muted-foreground"><Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" /> We'll pull out the colors and each piece, then link where to shop it.</p>
+        <p className="flex items-start gap-1.5 text-xs text-muted-foreground"><Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" /> Your crew sees the photo right away; we'll pull out the colors and each piece, then link where to shop it.</p>
         {hasExisting && <p className="rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground" data-testid="text-replace-warning">Replacing your pick clears your crew's reactions and unlocks it.</p>}
-        <Button onClick={() => m.mutate()} disabled={!file || m.isPending} className="w-full" size="lg" data-testid="button-post-pick">
-          {m.isPending ? "Reading the outfit…" : "Post to crew"}
+        <Button onClick={submit} disabled={!file} className="w-full" size="lg" data-testid="button-post-pick">
+          Post to crew
         </Button>
       </DialogContent>
     </Dialog>
@@ -309,10 +554,11 @@ interface PricesResponse {
 const PRICES_STALE_MS = 10 * 60 * 1000;
 
 /** Fetches live offers once per pick; failures (route missing, provider down) degrade to "no offers" rather than an error state. */
-function usePickPrices(pick: PickView | null) {
+function usePickPrices(pick: PickWithAnalysis | null) {
   return useQuery<PricesResponse>({
     queryKey: ["/api/picks", pick?.id, "prices"],
-    enabled: !!pick && pick.items.length > 0,
+    // Never hit /prices while the garments are still being read: items is [] until analysis is ready.
+    enabled: !!pick && analysisStatusOf(pick) === "ready" && pick.items.length > 0,
     staleTime: PRICES_STALE_MS,
     gcTime: PRICES_STALE_MS,
     retry: false,
@@ -442,9 +688,40 @@ function ShopCard({ item, index, pickId, loading }: { item: PricedItem; index: n
   );
 }
 
+/** Shop-card stand-ins shown in the drawer while analysis is pending. */
+function ShopCardsShimmer() {
+  return (
+    <div data-testid="status-analysis-pending" aria-busy="true" aria-live="polite">
+      <p className="mb-2 flex items-center gap-1.5 text-sm text-muted-foreground"><Sparkles className="h-3.5 w-3.5 animate-pulse text-primary" aria-hidden /> Reading the outfit…</p>
+      <ul className="space-y-2" aria-hidden>
+        {[0, 1].map((i) => (
+          <li key={i} className="rounded-xl border border-card-border bg-card p-3">
+            <div className="flex items-start gap-2.5">
+              <span className="shimmer mt-0.5 h-5 w-5 shrink-0 rounded-full" />
+              <div className="min-w-0 flex-1 space-y-1.5">
+                <div className="shimmer h-3.5 w-1/3 rounded" />
+                <div className="shimmer h-3 w-3/4 rounded" />
+              </div>
+            </div>
+            <div className="mt-2.5 flex items-center gap-2.5 rounded-lg bg-muted/60 p-2">
+              <div className="shimmer h-12 w-12 shrink-0 rounded-lg" />
+              <div className="min-w-0 flex-1 space-y-1.5">
+                <div className="shimmer h-3.5 w-2/3 rounded" />
+                <div className="shimmer h-3 w-1/2 rounded" />
+              </div>
+              <div className="shimmer h-8 w-14 shrink-0 rounded-md" />
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 // ---------- detail drawer ----------
-function PickDrawer({ pick, onClose, me, onDone }: { pick: PickView | null; onClose: () => void; me: PublicUser; onDone: () => void }) {
+function PickDrawer({ pick, onClose, me, onDone, onRetry, retrying = false }: { pick: PickWithAnalysis | null; onClose: () => void; me: PublicUser; onDone: () => void; onRetry?: (pickId: number) => void; retrying?: boolean }) {
   const [comment, setComment] = useState("");
+  const status = pick ? analysisStatusOf(pick) : "ready";
   const { toast } = useToast();
   const invalidate = onDone;
 
@@ -485,7 +762,13 @@ function PickDrawer({ pick, onClose, me, onDone }: { pick: PickView | null; onCl
               <img src={assetUrl(pick.photoPath)} alt="" className="aspect-[3/4] w-full rounded-2xl object-cover" />
               <div className="min-w-0">
                 {pick.note && <p className="mb-2 text-sm">{pick.note}</p>}
-                <Swatches colors={pick.palette} />
+                {status === "pending" ? (
+                  <span className="inline-flex -space-x-1.5" aria-hidden>
+                    {[0, 1, 2].map((i) => <span key={i} className="shimmer h-5 w-5 rounded-full ring-2 ring-card" style={{ animationDelay: `${i * 120}ms` }} />)}
+                  </span>
+                ) : (
+                  <Swatches colors={pick.palette} />
+                )}
                 <div className="mt-3 flex flex-wrap gap-1.5">
                   {emojiCounts.map(({ e, n, me: on }) => (
                     <button key={e} onClick={() => react.mutate({ emoji: e })} className={cn("rounded-full border px-2.5 py-1 text-sm hover-elevate", on ? "border-primary bg-primary/10" : "border-border bg-card")} data-testid={`button-react-${e}`}>
@@ -497,7 +780,18 @@ function PickDrawer({ pick, onClose, me, onDone }: { pick: PickView | null; onCl
             </div>
 
             <h3 className="mb-2 mt-5 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground"><Tag className="h-3.5 w-3.5" /> Shop the pieces</h3>
-            {pick.items.length === 0 ? (
+            {status === "pending" ? (
+              <ShopCardsShimmer />
+            ) : status === "failed" ? (
+              <div className="rounded-xl bg-muted p-3 text-sm text-muted-foreground" data-testid="status-analysis-failed">
+                <p>Couldn't read this outfit{pick.analysisError ? <span className="text-xs"> — {pick.analysisError}</span> : null}. Your crew can still see the photo.</p>
+                {mine && onRetry && (
+                  <button type="button" onClick={() => onRetry(pick.id)} disabled={retrying} className="mt-2 inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs font-semibold text-primary hover-elevate disabled:opacity-60" data-testid="button-retry-analysis">
+                    <RefreshCw className={cn("h-3 w-3", retrying && "animate-spin")} aria-hidden /> Retry
+                  </button>
+                )}
+              </div>
+            ) : pick.items.length === 0 ? (
               <p className="rounded-xl bg-muted p-3 text-sm text-muted-foreground">We couldn't read the pieces in this photo. A clearer, well-lit shot works best.</p>
             ) : (
               <>

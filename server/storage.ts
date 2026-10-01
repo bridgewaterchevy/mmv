@@ -20,12 +20,13 @@ import type {
   ReactionView,
   GarmentItem,
   ShopFor,
+  AnalysisStatus,
   Feedback,
   FeedbackReport,
   FeedbackStatus,
   FeedbackKind,
 } from "@shared/schema";
-import { and, eq, inArray, desc, asc, count, gte } from "drizzle-orm";
+import { and, eq, inArray, desc, asc, count, gte, lt } from "drizzle-orm";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { getDb } from "./db";
 import { wrapItems } from "./affiliate";
@@ -246,6 +247,7 @@ export class DatabaseStorage {
       items: wrapItems(applyShoppingHints(safeJson<GarmentItem[]>(p.items, []), user)),
       user,
       reactions: reactionViews,
+      analysisFailed: p.analysisStatus === "failed",
     };
   }
   async getPickForUser(sessionId: number, userId: number): Promise<Pick | undefined> {
@@ -264,9 +266,19 @@ export class DatabaseStorage {
     const [row] = await db.select().from(picks).where(eq(picks.id, id)).limit(1);
     return row;
   }
-  async upsertPick(data: { sessionId: number; userId: number; photoPath: string; note?: string | null; palette: string[]; items: GarmentItem[] }): Promise<Pick> {
+  async upsertPick(data: {
+    sessionId: number;
+    userId: number;
+    photoPath: string;
+    note?: string | null;
+    palette: string[];
+    items: GarmentItem[];
+    /** Defaults to "ready" (caller already has the analysis). The upload route passes "pending" and analyses later. */
+    analysisStatus?: AnalysisStatus;
+  }): Promise<Pick> {
     const db = await getDb();
     const existing = await this.getPickForUser(data.sessionId, data.userId);
+    const status = data.analysisStatus ?? "ready";
     const values = {
       photoPath: data.photoPath,
       note: data.note ?? null,
@@ -274,6 +286,9 @@ export class DatabaseStorage {
       items: JSON.stringify(data.items),
       locked: false,
       createdAt: new Date().toISOString(),
+      analysisStatus: status,
+      analysisError: null,
+      analyzedAt: status === "ready" ? new Date() : null,
     };
     if (existing) {
       await db.delete(reactions).where(eq(reactions.pickId, existing.id));
@@ -282,6 +297,64 @@ export class DatabaseStorage {
     }
     const [row] = await db.insert(picks).values({ sessionId: data.sessionId, userId: data.userId, ...values }).returning();
     return row;
+  }
+  /**
+   * Mark a pick as queued for (re-)analysis. Items/palette are kept until the new result lands so the
+   * crew keeps seeing the previous pieces while a retry runs.
+   */
+  async markAnalysisPending(pickId: number): Promise<Pick | undefined> {
+    const db = await getDb();
+    const [row] = await db
+      .update(picks)
+      .set({ analysisStatus: "pending", analysisError: null })
+      .where(eq(picks.id, pickId))
+      .returning();
+    return row;
+  }
+  /**
+   * Store a finished analysis. Guarded by `photoPath`: if the owner re-posted a different photo while this
+   * one was being analysed, the stale result is dropped (returns undefined) instead of overwriting the new pick.
+   */
+  async completeAnalysis(
+    pickId: number,
+    photoPath: string,
+    result: { palette: string[]; items: GarmentItem[]; note?: string | null },
+  ): Promise<Pick | undefined> {
+    const db = await getDb();
+    const set: Partial<typeof picks.$inferInsert> = {
+      palette: JSON.stringify(result.palette),
+      items: JSON.stringify(result.items),
+      analysisStatus: "ready",
+      analysisError: null,
+      analyzedAt: new Date(),
+    };
+    if (result.note !== undefined) set.note = result.note;
+    const [row] = await db
+      .update(picks)
+      .set(set)
+      .where(and(eq(picks.id, pickId), eq(picks.photoPath, photoPath)))
+      .returning();
+    return row;
+  }
+  /** Record a failed analysis (same photoPath guard as completeAnalysis). `error` must already be short and secret-free. */
+  async failAnalysis(pickId: number, photoPath: string, error: string): Promise<Pick | undefined> {
+    const db = await getDb();
+    const [row] = await db
+      .update(picks)
+      .set({ analysisStatus: "failed", analysisError: error.slice(0, 300), analyzedAt: new Date() })
+      .where(and(eq(picks.id, pickId), eq(picks.photoPath, photoPath)))
+      .returning();
+    return row;
+  }
+  /** Picks still "pending" whose created_at (ISO text) is older than `before`; used by startup recovery. */
+  async stalePendingPicks(before: Date): Promise<Pick[]> {
+    const db = await getDb();
+    return db
+      .select()
+      .from(picks)
+      .where(and(eq(picks.analysisStatus, "pending"), lt(picks.createdAt, before.toISOString())))
+      .orderBy(asc(picks.id))
+      .limit(200);
   }
   async setLocked(pickId: number, locked: boolean): Promise<Pick> {
     const db = await getDb();

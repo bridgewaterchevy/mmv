@@ -132,6 +132,17 @@ export interface GarmentItem {
   links: { label: string; url: string }[];
 }
 
+/**
+ * Lifecycle of the outfit analysis (server/analysis.ts). Posting a pick is instant; Gemini runs in the
+ * background afterwards:
+ *   "pending" -> queued or running; items/palette are [] until it finishes. Poll GET /api/picks/:id.
+ *   "ready"   -> items/palette filled (possibly empty if nothing was recognised), analyzedAt set.
+ *   "failed"  -> vision errored; analysisError holds a short, secret-free reason. POST /api/picks/:id/analyze retries.
+ * Rows created before this field existed default to "ready".
+ */
+export const ANALYSIS_STATUSES = ["pending", "ready", "failed"] as const;
+export type AnalysisStatus = (typeof ANALYSIS_STATUSES)[number];
+
 export const picks = pgTable("picks", {
   id: serial("id").primaryKey(),
   sessionId: integer("session_id").notNull(),
@@ -142,6 +153,9 @@ export const picks = pgTable("picks", {
   items: text("items").notNull().default("[]"), // JSON GarmentItem[]
   locked: boolean("locked").notNull().default(false),
   createdAt: text("created_at").notNull(),
+  analysisStatus: text("analysis_status").$type<AnalysisStatus>().notNull().default("ready"),
+  analysisError: text("analysis_error"), // short reason when analysisStatus = "failed", else null
+  analyzedAt: timestamp("analyzed_at", { withTimezone: true, mode: "date" }), // when the last analysis finished (ready or failed)
 });
 export type Pick = typeof picks.$inferSelect;
 export interface PickView extends Omit<Pick, "palette" | "items"> {
@@ -149,6 +163,8 @@ export interface PickView extends Omit<Pick, "palette" | "items"> {
   items: GarmentItem[];
   user: PublicUser;
   reactions: ReactionView[];
+  /** Compatibility alias: `analysisStatus === "failed"`. Prefer analysisStatus. */
+  analysisFailed: boolean;
 }
 
 // ---------- Reactions (emoji or short comment on a pick) ----------

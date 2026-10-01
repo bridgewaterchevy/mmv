@@ -1,0 +1,547 @@
+[
+  {
+    "check": "GET /api/health -> 200 {ok:true}",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "POST /api/auth/signup (user A, shopFor=womens) -> 200 {token,user}",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "signup echoes user.shopFor='womens'",
+    "pass": true,
+    "detail": "'womens'"
+  },
+  {
+    "check": "POST /api/auth/signup (user B) -> 200 {token,user}",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "signup response hides pin/token inside user",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "POST /api/auth/signup duplicate handle -> 409",
+    "pass": true,
+    "detail": "HTTP 409"
+  },
+  {
+    "check": "POST /api/auth/login (A, correct PIN) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "GET /api/me (A) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "/api/me returns our handle",
+    "pass": true,
+    "detail": "smoke_a_fouxzl3f"
+  },
+  {
+    "check": "/api/me carries shopFor",
+    "pass": true,
+    "detail": "'womens'"
+  },
+  {
+    "check": "GET /api/me without token -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "GET /api/me with bogus token -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "PATCH /api/me {shopFor:'mens'} -> 200 PublicUser",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "PATCH /api/me saved shopFor='mens' (no pin/token leaked)",
+    "pass": true,
+    "detail": "'mens'"
+  },
+  {
+    "check": "GET /api/me after PATCH -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "GET /api/me reflects shopFor='mens'",
+    "pass": true,
+    "detail": "'mens'"
+  },
+  {
+    "check": "PATCH /api/me invalid shopFor -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "PATCH /api/me without token -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "PATCH /api/me {shopFor:null} -> 200 (cleared)",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "shopFor cleared to null",
+    "pass": true,
+    "detail": "None"
+  },
+  {
+    "check": "PATCH /api/me {shopFor:'womens'} -> 200 (restored)",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "GET /api/crews (A, empty) -> 200 list",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "GET /api/crews returns a list",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "POST /api/crews (A) -> 200 {id,inviteCode,members}",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "new crew has creator as member",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "POST /api/crews invalid activity -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "POST /api/crews/join (B) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "crew now has 2 members",
+    "pass": true,
+    "detail": "2 members"
+  },
+  {
+    "check": "POST /api/crews/join bad code -> 404",
+    "pass": true,
+    "detail": "HTTP 404"
+  },
+  {
+    "check": "GET /api/crews/:id (B) -> 200 {sessions}",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "GET /api/crews/:id unauth -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "GET /api/crews/:id/day/:date (auto-create) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "day session has today's date",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "GET day again (B) -> 200 same session",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "day endpoint is idempotent (same session id)",
+    "pass": true,
+    "detail": "397 vs 397"
+  },
+  {
+    "check": "GET day with bad date -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "PATCH /api/sessions/:id {vibe} -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "vibe saved",
+    "pass": true,
+    "detail": "'all black'"
+  },
+  {
+    "check": "GET /api/sessions/:id (B) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "vibe visible to other member",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "POST /api/sessions/:id/picks JPEG (A) -> 201 (0.0s)",
+    "pass": true,
+    "detail": "HTTP 201"
+  },
+  {
+    "check": "upload responds in < 5s (analysis is async)",
+    "pass": true,
+    "detail": "0.0s"
+  },
+  {
+    "check": "upload response Cache-Control: no-store",
+    "pass": true,
+    "detail": "'no-store'"
+  },
+  {
+    "check": "pick.items is a list",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "pick.palette is a list",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "pick.note echoed",
+    "pass": true,
+    "detail": "'smoke test fit'"
+  },
+  {
+    "check": "pick.analysisStatus is pending|ready|failed",
+    "pass": true,
+    "detail": "'pending'"
+  },
+  {
+    "check": "analysisFailed mirrors analysisStatus",
+    "pass": true,
+    "detail": "False vs 'pending'"
+  },
+  {
+    "check": "pending pick has no items yet",
+    "pass": true,
+    "detail": "0 items"
+  },
+  {
+    "check": "pending pick has analysisError null",
+    "pass": true,
+    "detail": "None"
+  },
+  {
+    "check": "GET /api/picks/:id (A's pick, polled by B) sends Cache-Control: no-store",
+    "pass": true,
+    "detail": "'no-store'"
+  },
+  {
+    "check": "analysis settles to ready/failed within 90s (A's pick, polled by B)",
+    "pass": true,
+    "detail": "status='failed' after 1.0s / 2 poll(s)"
+  },
+  {
+    "check": "polled view keeps id/photoPath/note",
+    "pass": true,
+    "detail": "'smoke test fit'"
+  },
+  {
+    "check": "analysisFailed mirrors final analysisStatus",
+    "pass": true,
+    "detail": "True vs 'failed'"
+  },
+  {
+    "check": "analyzedAt set once analysis settled",
+    "pass": true,
+    "detail": "'2026-10-01T22:54:07.621Z'"
+  },
+  {
+    "check": "vision: garment recognition (lenient)",
+    "pass": true,
+    "detail": "analysisStatus=failed (\"Gemini 403: Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this\") -> vision unavailable (check GEMINI_API_KEY / Render logs for '[analysis]'); items=[] is acceptable"
+  },
+  {
+    "check": "failed pick carries a short analysisError",
+    "pass": true,
+    "detail": "\"Gemini 403: Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this\""
+  },
+  {
+    "check": "analysisError leaks no key/token",
+    "pass": true,
+    "detail": "\"Gemini 403: Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this\""
+  },
+  {
+    "check": "GET /api/picks/:id without token -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "GET /api/picks/:id unknown -> 404",
+    "pass": true,
+    "detail": "HTTP 404"
+  },
+  {
+    "check": "POST /api/picks/:id/analyze by non-owner (B) -> 403",
+    "pass": true,
+    "detail": "HTTP 403"
+  },
+  {
+    "check": "POST /api/picks/:id/analyze without token -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "POST /api/picks/:id/analyze unknown -> 404",
+    "pass": true,
+    "detail": "HTTP 404"
+  },
+  {
+    "check": "POST /api/picks/:id/analyze by owner (A) -> 200 PickView",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "re-run sets analysisStatus=pending (or already settled by a synchronous mock)",
+    "pass": true,
+    "detail": "'pending'"
+  },
+  {
+    "check": "re-run response Cache-Control: no-store",
+    "pass": true,
+    "detail": "'no-store'"
+  },
+  {
+    "check": "GET /api/picks/:id (after re-run) sends Cache-Control: no-store",
+    "pass": true,
+    "detail": "'no-store'"
+  },
+  {
+    "check": "analysis settles to ready/failed within 90s (after re-run)",
+    "pass": true,
+    "detail": "status='failed' after 1.0s / 2 poll(s)"
+  },
+  {
+    "check": "re-run keeps the same pick id / photo",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "GET /api/sessions/:id after upload -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "session view sends Cache-Control: no-store",
+    "pass": true,
+    "detail": "'no-store'"
+  },
+  {
+    "check": "session.picks[] carry analysisStatus + analysisFailed",
+    "pass": true,
+    "detail": [
+      [
+        397,
+        "failed"
+      ]
+    ]
+  },
+  {
+    "check": "GET photoPath -> 200 image/jpeg bytes",
+    "pass": true,
+    "detail": "http://localhost:5000/uploads/1790895247082-693624f46ac3d7ae.jpg HTTP 200 image/jpeg 12308 bytes"
+  },
+  {
+    "check": "photo bytes round-trip identical",
+    "pass": true,
+    "detail": "12308 vs 12308"
+  },
+  {
+    "check": "GET session shows 1 pick after A upload",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "session.picks has 1 entry",
+    "pass": true,
+    "detail": "1"
+  },
+  {
+    "check": "POST picks JPEG (B, no note) -> 201",
+    "pass": true,
+    "detail": "HTTP 201"
+  },
+  {
+    "check": "A and B picks are distinct",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "GET /api/picks/:id (A reads B's pick, same crew) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "POST picks .txt (text/plain) -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "POST picks text bytes declared image/jpeg -> 400 (magic-byte sniff)",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "POST picks without photo -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "POST picks without token -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "GET /api/picks/:id/prices (B on A's pick) -> 200 {items}",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "prices: items list mirrors pick.items, each with offers[]",
+    "pass": true,
+    "detail": "items=0, offers=0 (0 offers: no SERPAPI_KEY/HASDATA_API_KEY, budget spent, or no items)"
+  },
+  {
+    "check": "PATCH /api/picks/:id {locked:true} -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "pick is locked",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "PATCH other user's pick -> 404",
+    "pass": true,
+    "detail": "HTTP 404"
+  },
+  {
+    "check": "PATCH pick invalid body -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "PATCH {locked:false} -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "POST reactions {emoji} (B on A) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "emoji reaction present",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "POST reactions {comment} -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "comment reaction present",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "reactions carry user",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "POST reactions empty -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "GET /api/closet (A) -> 200 list",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "closet is a list containing our pick",
+    "pass": true,
+    "detail": "1"
+  },
+  {
+    "check": "POST /api/auth/login wrong PIN -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "POST /api/auth/login unknown handle -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "POST /api/auth/login malformed PIN -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "6+ wrong PINs in a row -> 429",
+    "pass": true,
+    "detail": "codes=[401, 401, 401, 401, 401, 429]"
+  },
+  {
+    "check": "correct PIN while locked out -> still 429",
+    "pass": true,
+    "detail": "HTTP 429"
+  },
+  {
+    "check": "DELETE /api/picks/397 (cleanup) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "DELETE /api/picks/397 again -> 404",
+    "pass": true,
+    "detail": "HTTP 404"
+  },
+  {
+    "check": "DELETE /api/picks/398 (cleanup) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "DELETE /api/picks/398 again -> 404",
+    "pass": true,
+    "detail": "HTTP 404"
+  },
+  {
+    "check": "closet empty after cleanup",
+    "pass": true,
+    "detail": "200 []"
+  }
+]

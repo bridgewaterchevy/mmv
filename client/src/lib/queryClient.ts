@@ -63,6 +63,47 @@ export async function apiRequest(method: string, url: string, data?: unknown): P
   return res;
 }
 
+/**
+ * Multipart upload with byte-level progress (fetch has no upload progress, so this uses XHR).
+ * Resolves with the parsed JSON body; rejects with ApiError on non-2xx like apiRequest does.
+ */
+export function apiUpload<T>(url: string, data: FormData, onProgress?: (fraction: number) => void): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const full = `${API_BASE}${url}`;
+    xhr.open("POST", full);
+    for (const [k, v] of Object.entries(authHeaders())) xhr.setRequestHeader(k, v);
+    xhr.responseType = "text";
+    if (onProgress) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable && e.total > 0) onProgress(Math.min(1, e.loaded / e.total));
+      };
+    }
+    xhr.onerror = () => {
+      recordApiError("POST", full, "Network error");
+      reject(new Error("Couldn't reach the server. Check your connection and try again."));
+    };
+    xhr.onabort = () => reject(new Error("Upload cancelled"));
+    xhr.onload = () => {
+      let body: unknown = null;
+      try {
+        body = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch {
+        /* non-JSON body */
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        onProgress?.(1);
+        resolve(body as T);
+        return;
+      }
+      const message = (body as { message?: string } | null)?.message || xhr.statusText || `${xhr.status}`;
+      recordApiError("POST", full, message, xhr.status);
+      reject(new ApiError(message, xhr.status));
+    };
+    xhr.send(data);
+  });
+}
+
 export async function apiJson<T>(method: string, url: string, data?: unknown): Promise<T> {
   const res = await apiRequest(method, url, data);
   return (await res.json()) as T;

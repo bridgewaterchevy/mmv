@@ -23,6 +23,21 @@ export interface FileStore {
   put(buffer: Buffer, ext: string, mime: string, name?: string): Promise<string>;
   /** Best-effort delete of a previously stored photoPath. Never throws. */
   remove(photoPath: string): Promise<void>;
+  /** Load a stored photo back (for background re-analysis when the upload buffer is gone). Throws if missing. */
+  read(photoPath: string): Promise<{ buffer: Buffer; mime: string }>;
+}
+
+const MIME_BY_EXT: Record<string, string> = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+  ".heic": "image/heic",
+  ".heif": "image/heif",
+};
+export function mimeFromPath(p: string): string {
+  return MIME_BY_EXT[path.extname(p.split("?")[0]).toLowerCase()] ?? "image/jpeg";
 }
 
 export const UPLOAD_DIR = path.resolve("uploads");
@@ -66,10 +81,19 @@ class LocalStore implements FileStore {
     return `/uploads/${key}`;
   }
   async remove(photoPath: string) {
-    if (!photoPath.startsWith("/uploads/")) return;
-    const file = path.resolve(UPLOAD_DIR, photoPath.slice("/uploads/".length).split("?")[0]);
-    if (!file.startsWith(UPLOAD_DIR + path.sep)) return;
+    const file = this.resolve(photoPath);
+    if (!file) return;
     await fs.promises.rm(file, { force: true }).catch(() => {});
+  }
+  async read(photoPath: string) {
+    const file = this.resolve(photoPath);
+    if (!file) throw new Error("photo is not a local upload");
+    return { buffer: await fs.promises.readFile(file), mime: mimeFromPath(photoPath) };
+  }
+  private resolve(photoPath: string): string | null {
+    if (!photoPath.startsWith("/uploads/")) return null;
+    const file = path.resolve(UPLOAD_DIR, photoPath.slice("/uploads/".length).split("?")[0]);
+    return file.startsWith(UPLOAD_DIR + path.sep) ? file : null;
   }
 }
 
@@ -130,6 +154,15 @@ class SupabaseStore implements FileStore {
     const sb = await this.sb();
     const { error } = await sb.storage.from(this.bucket).remove([name]);
     if (error) console.error("[files] remove failed", error.message);
+  }
+
+  async read(photoPath: string) {
+    const name = this.objectFromUrl(photoPath);
+    if (!name) throw new Error("photo is not in this bucket");
+    const sb = await this.sb();
+    const { data, error } = await sb.storage.from(this.bucket).download(name);
+    if (error || !data) throw new Error(`photo download failed: ${error?.message ?? "no data"}`);
+    return { buffer: Buffer.from(await data.arrayBuffer()), mime: data.type || mimeFromPath(name) };
   }
 
   private objectFromUrl(photoPath: string): string | null {

@@ -326,10 +326,39 @@ def run_server_test():
         api("POST", "/api/crews/join", tok_b, json={"inviteCode": crew["inviteCode"]})
         sess = api("GET", f"/api/crews/{crew['id']}/day/2030-01-01", tok_a).json()
         jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+        t0 = time.time()
         up = api("POST", f"/api/sessions/{sess['id']}/picks", tok_a, files={"photo": ("o.jpg", jpeg, "image/jpeg")})
-        pick = up.json()
-        if not check("upload with MOCK_VISION_JSON -> 200 with 2 items", up.status_code == 200 and len(pick.get("items", [])) == 2, f"{up.status_code} {str(pick)[:200]}"):
+        posted = up.json()
+        # Posting is instant now: 201 with analysisStatus "pending" and no items; the (mocked) analysis runs in the background.
+        if not check("upload -> 201 instantly with analysisStatus pending|ready and no-store",
+                     up.status_code == 201 and posted.get("analysisStatus") in ("pending", "ready") and time.time() - t0 < 5
+                     and "no-store" in up.headers.get("Cache-Control", "").lower(),
+                     f"{up.status_code} {up.headers.get('Cache-Control')} {str(posted)[:200]}"):
             return
+        check("upload: analysisFailed false while pending", posted.get("analysisFailed") is False, repr(posted.get("analysisFailed")))
+        pick = posted
+        deadline = time.time() + 30
+        while pick.get("analysisStatus") == "pending" and time.time() < deadline:
+            time.sleep(0.2)
+            g = api("GET", f"/api/picks/{posted['id']}", tok_a)
+            pick = g.json() if g.status_code == 200 else pick
+        if not check("GET /api/picks/:id settles to ready with 2 items (MOCK_VISION_JSON)",
+                     pick.get("analysisStatus") == "ready" and len(pick.get("items", [])) == 2 and pick.get("analysisError") is None and pick.get("analyzedAt"),
+                     f"{str(pick)[:300]}"):
+            return
+        check("pick view: note falls back to the vision summary when the owner left it blank", pick.get("note") == MOCK_VISION.get("summary"), repr(pick.get("note")))
+        # owner-only retry: non-owner 403, owner -> pending again -> settles to ready; non-member GET -> 403
+        check("GET /api/picks/:id non-member -> 403", api("GET", f"/api/picks/{pick['id']}", tok_c).status_code == 403)
+        check("POST /api/picks/:id/analyze non-owner -> 403", api("POST", f"/api/picks/{pick['id']}/analyze", tok_b).status_code == 403)
+        ra = api("POST", f"/api/picks/{pick['id']}/analyze", tok_a)
+        check("POST /api/picks/:id/analyze owner -> 200 pending", ra.status_code == 200 and ra.json().get("analysisStatus") == "pending", f"{ra.status_code} {ra.text[:200]}")
+        deadline = time.time() + 30
+        again = ra.json()
+        while again.get("analysisStatus") == "pending" and time.time() < deadline:
+            time.sleep(0.2)
+            again = api("GET", f"/api/picks/{pick['id']}", tok_a).json()
+        check("re-analysis settles to ready with 2 items again", again.get("analysisStatus") == "ready" and len(again.get("items", [])) == 2, str(again)[:200])
+        pick = again
         links = pick["items"][0]["links"]
         amazon = [l for l in links if l["label"] == "Amazon"]
         brand = [l for l in links if l["label"].endswith("site")]

@@ -7,8 +7,10 @@ when no real server is available:
     python tests/smoke.py --base http://localhost:5999
 
 It mirrors server/routes.ts status codes (401/400/404/409/429), magic-byte sniffing,
-the 6-attempt login limiter and the upsert-one-pick-per-user behaviour. It does NOT
-call Gemini: every pick returns analysisFailed=true with empty items.
+the 6-attempt login limiter and the upsert-one-pick-per-user behaviour, plus the async
+analysis contract: POST picks -> 201 with analysisStatus "pending"; the first GET /api/picks/:id
+afterwards flips it to "failed" (no Gemini here: analysisError set, analysisFailed=true, items []).
+POST /api/picks/:id/analyze (owner only, 403 otherwise) re-queues the same way.
 """
 import json
 import re
@@ -19,6 +21,7 @@ from email.parser import BytesParser
 from email.policy import HTTP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+SHOP_FOR = ("womens", "mens", "unisex")
 DB = {"users": {}, "tokens": {}, "crews": {}, "sessions": {}, "picks": {}, "reactions": [], "files": {}}
 SEQ = {"u": 0, "c": 0, "s": 0, "p": 0}
 LOGIN_ATTEMPTS = {}
@@ -35,9 +38,19 @@ def pub(u):
 
 def pick_view(p):
     v = dict(p)
+    v["analysisFailed"] = p.get("analysisStatus") == "failed"
     v["user"] = pub(DB["users"][p["userId"]])
     v["reactions"] = [dict(r, user=pub(DB["users"][r["userId"]])) for r in DB["reactions"] if r["pickId"] == p["id"]]
     return v
+
+
+def settle_analysis(p):
+    """Simulate the background job finishing: the mock has no vision, so pending -> failed."""
+    if p.get("analysisStatus") == "pending":
+        p["analysisStatus"] = "failed"
+        p["analysisError"] = "vision unavailable in mock_api"
+        p["analyzedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return p
 
 
 def session_view(s):
@@ -70,11 +83,13 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def send(self, code, body=None, ctype="application/json", raw=None):
+    def send(self, code, body=None, ctype="application/json", raw=None, extra=None):
         data = raw if raw is not None else json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
 
@@ -124,7 +139,26 @@ class H(BaseHTTPRequestHandler):
             s = DB["sessions"].get(int(m[1]))
             if not s or u["id"] not in DB["crews"][s["crewId"]]["members"]:
                 return self.send(404, {"message": "Session not found"})
-            return self.send(200, session_view(s))
+            return self.send(200, session_view(s), extra={"Cache-Control": "no-store"})
+        m = re.fullmatch(r"/api/picks/(\d+)", p)
+        if m:
+            pk = DB["picks"].get(int(m[1]))
+            if not pk:
+                return self.send(404, {"message": "Pick not found"})
+            s = DB["sessions"][pk["sessionId"]]
+            if u["id"] not in DB["crews"][s["crewId"]]["members"]:
+                return self.send(403, {"message": "Not your crew"})
+            return self.send(200, pick_view(settle_analysis(pk)), extra={"Cache-Control": "no-store"})
+        m = re.fullmatch(r"/api/picks/(\d+)/prices", p)
+        if m:
+            pk = DB["picks"].get(int(m[1]))
+            if not pk:
+                return self.send(404, {"message": "Pick not found"})
+            s = DB["sessions"][pk["sessionId"]]
+            if u["id"] not in DB["crews"][s["crewId"]]["members"]:
+                return self.send(403, {"message": "Not your crew"})
+            items = [dict(i, shoppingQuery=i.get("searchQuery", ""), offers=[]) for i in pk["items"]]
+            return self.send(200, {"pickId": pk["id"], "items": items})
         if p == "/api/closet":
             return self.send(200, [pick_view(x) for x in DB["picks"].values() if x["userId"] == u["id"]])
         self.send(404, {"message": "nope"})
@@ -145,7 +179,10 @@ class H(BaseHTTPRequestHandler):
                 return self.send(400, {"message": "Invalid"})
             if any(x["handle"].lower() == h.lower() for x in DB["users"].values()):
                 return self.send(409, {"message": "That handle is taken"})
-            u = {"id": nid("u"), "name": name, "handle": h.lower(), "pin": pin, "color": "#ff00aa", "token": secrets.token_hex(16)}
+            sf = js.get("shopFor")
+            if sf is not None and sf not in SHOP_FOR:
+                return self.send(400, {"message": "shopFor must be womens, mens or unisex"})
+            u = {"id": nid("u"), "name": name, "handle": h.lower(), "pin": pin, "color": "#ff00aa", "token": secrets.token_hex(16), "shopFor": sf}
             DB["users"][u["id"]] = u
             DB["tokens"][u["token"]] = u["id"]
             return self.send(200, {"token": u["token"], "user": pub(u)})
@@ -208,14 +245,25 @@ class H(BaseHTTPRequestHandler):
             path = f"/uploads/{int(time.time()*1000)}-{secrets.token_hex(8)}{kind[0]}"
             DB["files"][path] = photo
             old = next((x for x in DB["picks"].values() if x["sessionId"] == s["id"] and x["userId"] == u["id"]), None)
+            fresh = {"photoPath": path, "note": note, "palette": [], "items": [], "locked": False, "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     "analysisStatus": "pending", "analysisError": None, "analyzedAt": None}
             if old:
                 DB["files"].pop(old["photoPath"], None)
-                old.update(photoPath=path, note=note)
+                old.update(fresh)
                 pk = old
             else:
-                pk = {"id": nid("p"), "sessionId": s["id"], "userId": u["id"], "photoPath": path, "note": note, "palette": [], "items": [], "locked": False, "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ")}
+                pk = dict(fresh, id=nid("p"), sessionId=s["id"], userId=u["id"])
                 DB["picks"][pk["id"]] = pk
-            return self.send(200, dict(pick_view(pk), analysisFailed=True))
+            return self.send(201, pick_view(pk), extra={"Cache-Control": "no-store"})
+        m = re.fullmatch(r"/api/picks/(\d+)/analyze", p)
+        if m:
+            pk = DB["picks"].get(int(m[1]))
+            if not pk:
+                return self.send(404, {"message": "Pick not found"})
+            if pk["userId"] != u["id"]:
+                return self.send(403, {"message": "Only the owner can re-run the analysis"})
+            pk.update(analysisStatus="pending", analysisError=None)
+            return self.send(200, pick_view(pk), extra={"Cache-Control": "no-store"})
         m = re.fullmatch(r"/api/picks/(\d+)/reactions", p)
         if m:
             pk = DB["picks"].get(int(m[1]))
@@ -237,6 +285,11 @@ class H(BaseHTTPRequestHandler):
         u = self.user()
         if not u:
             return self.send(401, {"message": "Sign in first"})
+        if p == "/api/me":
+            if "shopFor" not in js or (js["shopFor"] is not None and js["shopFor"] not in SHOP_FOR):
+                return self.send(400, {"message": "shopFor must be womens, mens or unisex"})
+            u["shopFor"] = js["shopFor"]
+            return self.send(200, pub(u))
         m = re.fullmatch(r"/api/sessions/(\d+)", p)
         if m:
             s = DB["sessions"].get(int(m[1]))

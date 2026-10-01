@@ -113,10 +113,18 @@ const DDL = [
     palette TEXT NOT NULL DEFAULT '[]',
     items TEXT NOT NULL DEFAULT '[]',
     locked BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    analysis_status TEXT NOT NULL DEFAULT 'ready',
+    analysis_error TEXT,
+    analyzed_at TIMESTAMPTZ
   )`,
+  // Background outfit analysis (server/analysis.ts). Existing rows were analysed inline at upload -> 'ready'.
+  `ALTER TABLE picks ADD COLUMN IF NOT EXISTS analysis_status TEXT NOT NULL DEFAULT 'ready'`,
+  `ALTER TABLE picks ADD COLUMN IF NOT EXISTS analysis_error TEXT`,
+  `ALTER TABLE picks ADD COLUMN IF NOT EXISTS analyzed_at TIMESTAMPTZ`,
   `CREATE INDEX IF NOT EXISTS picks_session_idx ON picks (session_id)`,
   `CREATE INDEX IF NOT EXISTS picks_user_idx ON picks (user_id)`,
+  `CREATE INDEX IF NOT EXISTS picks_analysis_status_idx ON picks (analysis_status)`,
   `CREATE TABLE IF NOT EXISTS reactions (
     id SERIAL PRIMARY KEY,
     pick_id INTEGER NOT NULL,

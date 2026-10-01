@@ -104,6 +104,23 @@ Screenshots live in the same Supabase bucket as outfit photos under `feedback/<i
 - Reports are still in the database either way: Supabase → **Table Editor** → `feedback` (or `GET /api/feedback` as an admin).
 - Existing deployments get the `kind` column automatically at boot (`ALTER TABLE feedback ADD COLUMN IF NOT EXISTS kind … DEFAULT 'problem'`); older rows read as `problem`.
 
+## Outfit analysis runs in the background (picks)
+
+Posting a pick no longer waits for Gemini. `POST /api/sessions/:id/picks` stores the photo and answers `201` right away with `analysisStatus: "pending"`; a small in-process queue (`server/analysis.ts`, at most `VISION_CONCURRENCY` = 2 Gemini calls at a time) fills in `items`/`palette` afterwards and the app polls `GET /api/picks/:id` until the status is `ready` or `failed`. Old rows (analysed inline at upload) read as `ready`.
+
+What you will see in Render **Logs**:
+
+| Line | Meaning |
+| --- | --- |
+| `[analysis] pick 42 ready: 3 item(s) in 18342ms (upload)` | normal; the number in brackets is the trigger (`upload`, `retry`, `recovery`, `sweep`) |
+| `[analysis] pick 42 failed after 1203ms (upload): Gemini 429: …` | vision errored; the short reason is also stored on the pick (`analysisError`) and shown to the owner, who can tap retry (`POST /api/picks/:id/analyze`, 10 per hour per user) |
+| `[analysis] recovery: re-queued N pending pick(s) older than 120s` | printed once per boot; picks a previous process left `pending` are re-run (their photo is reloaded from storage) |
+| `[analysis] pick 42: photo changed before analysis started; skipping stale job` | the owner re-posted while a job was queued; harmless |
+
+Knobs (environment variables, all optional): `VISION_CONCURRENCY` (default 2), `VISION_TIMEOUT_MS` (per Gemini call, default 120000), `VISION_RECOVERY_AGE_MS` (boot recovery threshold, default 120000), `VISION_SWEEP=0` disables the 10-minute safety sweep, `VISION_DOWNSCALE=0` skips the optional server-side resize (only active if the `sharp` package is installed — it is not by default; the app resizes photos to ~1280 px before upload).
+
+If many picks sit in `pending` for minutes: the server is probably not running jobs (look for the recovery line after a restart) or Gemini is slow; `failed` picks with `Gemini 403/400` mean the key is missing or invalid (`GEMINI_API_KEY` on Render), `Gemini 429` means quota. Nothing is lost either way — the photo is stored and the crew sees it immediately; only the shopping pieces wait.
+
 ## Rotate a secret
 
 Render → **mmv** → **Environment** → edit the value → save; Render redeploys. Secrets to rotate if leaked: `SUPABASE_SERVICE_ROLE_KEY` (Supabase → Project Settings → API Keys → create a new secret key, then delete the old one), the database password (Supabase → Project Settings → Database → Reset database password, then update `DATABASE_URL`), `GEMINI_API_KEY` (Google AI Studio → delete and create a key), and `GITHUB_ISSUES_TOKEN` (GitHub → Settings → Developer settings → Fine-grained tokens → **Regenerate** or delete + create; see "Report a problem" above).

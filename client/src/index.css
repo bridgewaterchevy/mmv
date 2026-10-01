@@ -324,3 +324,17 @@ body { -webkit-tap-highlight-color: transparent; overscroll-behavior-y: none; }
 .no-scrollbar { scrollbar-width: none; }
 @keyframes fade-up { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .fade-up { animation: fade-up .32s cubic-bezier(.2,.8,.2,1) both; }
+
+/* Shimmer for "reading the outfit" placeholders (chips, palette, shop cards) and the upload bar. */
+@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+.shimmer {
+  background-color: hsl(var(--muted));
+  background-image: linear-gradient(90deg, hsl(var(--muted)) 0%, hsl(var(--muted-foreground) / 0.16) 50%, hsl(var(--muted)) 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.6s linear infinite;
+}
+@keyframes upload-indeterminate { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
+.upload-indeterminate { animation: upload-indeterminate 1.2s cubic-bezier(.4,0,.2,1) infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .shimmer, .upload-indeterminate { animation: none; }
+}

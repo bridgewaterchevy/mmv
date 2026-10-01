@@ -12,7 +12,10 @@ Dependencies: Python 3.8+, `requests`, `Pillow` (pip install requests pillow).
 What it does (end to end, with two throwaway users):
   health -> signup A/B (A with shopFor) -> login A -> /api/me -> PATCH /api/me {shopFor} -> create crew (A) -> join by invite (B)
   -> GET crew -> GET day (auto-creates session) -> PATCH vibe -> GET session
-  -> upload synthetic JPEG as A (checks items/palette/analysisFailed, fetches photoPath)
+  -> upload synthetic JPEG as A: 201 in < 5 s with analysisStatus "pending" (or already "ready"/"failed"
+     when vision is mocked synchronously) -> poll GET /api/picks/:id (Cache-Control: no-store) until
+     ready/failed (<= 90 s) -> checks items/palette/analysisFailed, fetches photoPath
+  -> POST /api/picks/:id/analyze: B (not owner) 403, A 200 pending -> poll again; unknown pick 404
   -> upload as B -> .txt upload rejected 400 -> lazy prices for A's pick (200 {items}; offers may be
      empty without SERPAPI_KEY/HASDATA_API_KEY) -> lock/unlock pick -> emoji + comment reactions
   -> closet -> report a problem (POST /api/feedback 200 {id, kind, githubIssueUrl}, kind=suggestion 200,
@@ -47,7 +50,10 @@ except ImportError:
     sys.exit(2)
 
 TIMEOUT = 30
-UPLOAD_TIMEOUT = 120  # vision analysis can take a while on free tiers
+UPLOAD_TIMEOUT = 60  # the upload itself should answer in well under 5 s; vision runs in the background
+UPLOAD_FAST_S = 5.0  # POST picks must respond within this (analysis is asynchronous)
+ANALYSIS_TIMEOUT = 90  # how long to poll GET /api/picks/:id for ready/failed
+ANALYSIS_STATUSES = ("pending", "ready", "failed")
 
 RESULTS = []  # (name, ok, detail)
 VERBOSE = False
@@ -130,6 +136,31 @@ def resolve_photo_url(base, photo_path):
     if re.match(r"^https?://", photo_path or ""):
         return photo_path
     return base.rstrip("/") + "/" + (photo_path or "").lstrip("/")
+
+
+def wait_for_analysis(api, pick_id, token, label, timeout=ANALYSIS_TIMEOUT):
+    """Poll GET /api/picks/:id until analysisStatus leaves "pending". Returns (final_view_or_None, elapsed)."""
+    t0 = time.time()
+    last = None
+    polls = 0
+    while time.time() - t0 < timeout:
+        r = api("GET", f"/api/picks/{pick_id}", token)
+        polls += 1
+        if r.status_code != 200:
+            record(f"poll GET /api/picks/:id ({label}) -> 200", False, f"HTTP {r.status_code} {r.text[:120]}")
+            return None, time.time() - t0
+        last = r.json()
+        if polls == 1:
+            check(f"GET /api/picks/:id ({label}) sends Cache-Control: no-store",
+                  "no-store" in r.headers.get("Cache-Control", "").lower(), repr(r.headers.get("Cache-Control")))
+        if last.get("analysisStatus") != "pending":
+            break
+        time.sleep(1.0)
+    elapsed = time.time() - t0
+    status = (last or {}).get("analysisStatus")
+    record(f"analysis settles to ready/failed within {timeout}s ({label})", status in ("ready", "failed"),
+           f"status={status!r} after {elapsed:.1f}s / {polls} poll(s)")
+    return last, elapsed
 
 
 # --------------------------------------------------------------------------- main flow
@@ -263,7 +294,7 @@ def run(base):
         if got:
             check("vibe visible to other member", got["vibe"] == "all black")
 
-        # ---- picks: real JPEG upload as A
+        # ---- picks: real JPEG upload as A. Must answer fast (201 + analysisStatus pending); vision runs in the background.
         jpeg = make_jpeg()
         t0 = time.time()
         r = api(
@@ -274,29 +305,87 @@ def run(base):
         )
         elapsed = time.time() - t0
         pick_a = expect(
-            f"POST /api/sessions/:id/picks JPEG (A) -> 200 ({elapsed:.1f}s)", r, 200,
-            ["id", "photoPath", "items", "palette", "analysisFailed", "user", "reactions", "locked"],
+            f"POST /api/sessions/:id/picks JPEG (A) -> 201 ({elapsed:.1f}s)", r, 201,
+            ["id", "photoPath", "items", "palette", "analysisStatus", "analysisFailed", "user", "reactions", "locked"],
         )
         if not pick_a:
             raise Skip("upload failed")
         pick_ids.append((pick_a["id"], tok_a))
+        check(f"upload responds in < {UPLOAD_FAST_S:.0f}s (analysis is async)", elapsed < UPLOAD_FAST_S, f"{elapsed:.1f}s")
+        check("upload response Cache-Control: no-store", "no-store" in r.headers.get("Cache-Control", "").lower(), repr(r.headers.get("Cache-Control")))
         check("pick.items is a list", isinstance(pick_a["items"], list))
         check("pick.palette is a list", isinstance(pick_a["palette"], list))
         check("pick.note echoed", pick_a.get("note") == "smoke test fit", repr(pick_a.get("note")))
+        st0 = pick_a.get("analysisStatus")
+        check("pick.analysisStatus is pending|ready|failed", st0 in ANALYSIS_STATUSES, repr(st0))
+        check("analysisFailed mirrors analysisStatus", pick_a.get("analysisFailed") is (st0 == "failed"), f"{pick_a.get('analysisFailed')!r} vs {st0!r}")
+        if st0 == "pending":
+            check("pending pick has no items yet", pick_a["items"] == [] and pick_a["palette"] == [], f"{len(pick_a['items'])} items")
+            check("pending pick has analysisError null", pick_a.get("analysisError") is None, repr(pick_a.get("analysisError")))
+        else:
+            record("upload already analysed (synchronous mock vision)", True, f"analysisStatus={st0}")
+
+        # poll until the background analysis settles
+        final, waited = wait_for_analysis(api, pick_a["id"], tok_b, "A's pick, polled by B")
+        if final is None:
+            raise Skip("polling failed")
+        pick_a = final
+        check("polled view keeps id/photoPath/note", pick_a.get("note") == "smoke test fit" and "photoPath" in pick_a, repr(pick_a.get("note")))
+        check("analysisFailed mirrors final analysisStatus", pick_a.get("analysisFailed") is (pick_a.get("analysisStatus") == "failed"),
+              f"{pick_a.get('analysisFailed')!r} vs {pick_a.get('analysisStatus')!r}")
+        if pick_a.get("analysisStatus") in ("ready", "failed"):
+            check("analyzedAt set once analysis settled", bool(pick_a.get("analyzedAt")), repr(pick_a.get("analyzedAt")))
 
         # Vision check: lenient. Fail only on inconsistent state (analysis "succeeded" but produced nothing).
-        failed = pick_a["analysisFailed"]
+        failed = pick_a.get("analysisStatus") == "failed"
         n_items = len(pick_a["items"])
         if failed:
+            err = pick_a.get("analysisError")
             record("vision: garment recognition (lenient)", True,
-                   "analysisFailed=true -> vision unavailable (check GEMINI_API_KEY / Render logs for 'vision failed'); items=[] is acceptable")
+                   f"analysisStatus=failed ({err!r}) -> vision unavailable (check GEMINI_API_KEY / Render logs for '[analysis]'); items=[] is acceptable")
+            check("failed pick carries a short analysisError", isinstance(err, str) and 0 < len(err) <= 300, repr(err))
+            check("analysisError leaks no key/token", not re.search(r"(AIza[0-9A-Za-z_-]{20,}|api[-_]?key=|token=)", err or "", re.I), repr(err))
         else:
             cats = [i.get("category") for i in pick_a["items"] if isinstance(i, dict)]
             ok_shape = all(isinstance(i, dict) and "category" in i and "colorHex" in i for i in pick_a["items"])
             record("vision: garment recognition (lenient)", ok_shape,
-                   f"analysisFailed=false, items={n_items} {cats[:5]}, palette={pick_a['palette'][:5]}"
+                   f"analysisStatus=ready, items={n_items} {cats[:5]}, palette={pick_a['palette'][:5]}"
                    + ("" if n_items else " (WARNING: analysis succeeded but found no garments)"))
-        print(f"  >> VISION: {'FAILED (analysisFailed=true)' if failed else ('WORKED, ' + str(n_items) + ' item(s) recognized' if n_items else 'ran but recognized 0 items')}")
+            check("ready pick has analysisError null", pick_a.get("analysisError") is None, repr(pick_a.get("analysisError")))
+        print(f"  >> VISION: {'FAILED (analysisStatus=failed)' if failed else ('WORKED, ' + str(n_items) + ' item(s) recognized' if n_items else 'ran but recognized 0 items')} after {waited:.1f}s")
+
+        # ---- GET /api/picks/:id negative paths
+        r = api("GET", f"/api/picks/{pick_a['id']}")
+        expect("GET /api/picks/:id without token -> 401", r, 401)
+        r = api("GET", "/api/picks/999999999", tok_a)
+        expect("GET /api/picks/:id unknown -> 404", r, 404)
+
+        # ---- POST /api/picks/:id/analyze (owner-only re-run)
+        r = api("POST", f"/api/picks/{pick_a['id']}/analyze", tok_b)
+        expect("POST /api/picks/:id/analyze by non-owner (B) -> 403", r, 403)
+        r = api("POST", f"/api/picks/{pick_a['id']}/analyze")
+        expect("POST /api/picks/:id/analyze without token -> 401", r, 401)
+        r = api("POST", "/api/picks/999999999/analyze", tok_a)
+        expect("POST /api/picks/:id/analyze unknown -> 404", r, 404)
+        r = api("POST", f"/api/picks/{pick_a['id']}/analyze", tok_a)
+        re_run = expect("POST /api/picks/:id/analyze by owner (A) -> 200 PickView", r, 200, ["id", "analysisStatus", "items", "user"])
+        if re_run:
+            check("re-run sets analysisStatus=pending (or already settled by a synchronous mock)", re_run["analysisStatus"] in ANALYSIS_STATUSES, repr(re_run["analysisStatus"]))
+            check("re-run response Cache-Control: no-store", "no-store" in r.headers.get("Cache-Control", "").lower(), repr(r.headers.get("Cache-Control")))
+            final2, waited2 = wait_for_analysis(api, pick_a["id"], tok_a, "after re-run")
+            if final2:
+                check("re-run keeps the same pick id / photo", final2["id"] == pick_a["id"] and final2["photoPath"] == pick_a["photoPath"])
+                print(f"  >> RE-RUN: analysisStatus={final2.get('analysisStatus')} with {len(final2.get('items', []))} item(s) after {waited2:.1f}s")
+                pick_a = final2
+
+        # session view carries the status for every pick
+        r = api("GET", f"/api/sessions/{sess_id}", tok_b)
+        svs = expect("GET /api/sessions/:id after upload -> 200", r, 200, ["picks"])
+        if svs:
+            check("session view sends Cache-Control: no-store", "no-store" in r.headers.get("Cache-Control", "").lower(), repr(r.headers.get("Cache-Control")))
+            check("session.picks[] carry analysisStatus + analysisFailed",
+                  all("analysisStatus" in p and "analysisFailed" in p for p in svs["picks"]) and bool(svs["picks"]),
+                  [(p.get("id"), p.get("analysisStatus")) for p in svs["picks"]])
 
         # fetch the photo
         photo_url = resolve_photo_url(base, pick_a["photoPath"])
@@ -321,10 +410,12 @@ def run(base):
             "POST", f"/api/sessions/{sess_id}/picks", tok_b,
             files={"photo": ("fit.jpg", jpeg, "image/jpeg")}, timeout=UPLOAD_TIMEOUT,
         )
-        pick_b = expect("POST picks JPEG (B, no note) -> 200", r, 200, ["id", "photoPath", "analysisFailed"])
+        pick_b = expect("POST picks JPEG (B, no note) -> 201", r, 201, ["id", "photoPath", "analysisStatus", "analysisFailed"])
         if pick_b:
             pick_ids.append((pick_b["id"], tok_b))
             check("A and B picks are distinct", pick_b["id"] != pick_a["id"])
+            r = api("GET", f"/api/picks/{pick_b['id']}", tok_a)
+            expect("GET /api/picks/:id (A reads B's pick, same crew) -> 200", r, 200, ["id", "analysisStatus"])
 
         # bad uploads
         r = api("POST", f"/api/sessions/{sess_id}/picks", tok_a,
