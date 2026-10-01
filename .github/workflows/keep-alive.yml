@@ -27,7 +27,7 @@ permissions: {}
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 10
     steps:
       - name: Ping /api/health (wakes Render; touches Supabase if the health route queries the DB)
         env:
@@ -38,6 +38,14 @@ jobs:
             echo "Repository variable APP_URL is not set." >&2
             exit 1
           fi
-          curl -fsS --max-time 30 "https://${APP_URL}/api/health"
-          echo
-          echo "ok (${{ github.event.schedule || 'manual' }})"
+          # Render free instances take 50s+ to cold-start and return 502/503 while a deploy is in
+          # progress, so wait long and retry rather than failing (a failed run only means noise;
+          # the request itself already woke the instance).
+          for attempt in 1 2 3 4; do
+            if curl -fsS --max-time 120 "https://${APP_URL}/api/health"; then
+              echo; echo "ok on attempt ${attempt} (${{ github.event.schedule || 'manual' }})"; exit 0
+            fi
+            echo "attempt ${attempt} failed; retrying in 20s" >&2; sleep 20
+          done
+          echo "health check failed after 4 attempts" >&2
+          exit 1

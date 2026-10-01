@@ -76,8 +76,11 @@ const DDL = [
     handle TEXT NOT NULL UNIQUE,
     pin TEXT NOT NULL,
     color TEXT NOT NULL,
-    token TEXT NOT NULL UNIQUE
+    token TEXT NOT NULL UNIQUE,
+    shop_for TEXT
   )`,
+  // Existing databases (Supabase) created before shop_for existed: add the column in place.
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS shop_for TEXT`,
   `CREATE TABLE IF NOT EXISTS crews (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,

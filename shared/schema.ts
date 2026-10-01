@@ -3,6 +3,14 @@ import { createInsertSchema } from "drizzle-zod";
 import type * as z from "zod/mini";
 
 // ---------- Users ----------
+/**
+ * Which department a user shops in. Used as a hint on shopping price queries (server/prices.ts
+ * buildShoppingQuery): "womens" → "women's <query>", "mens" → "men's <query>", "unisex" → no hint
+ * (fall back to the garment's vision `fit`), null → unknown (also falls back to `fit`).
+ */
+export const SHOP_FOR = ["womens", "mens", "unisex"] as const;
+export type ShopFor = (typeof SHOP_FOR)[number];
+
 export const users = pgTable("users", {
   id: serial("id").primaryKey(),
   name: text("name").notNull(),
@@ -10,6 +18,7 @@ export const users = pgTable("users", {
   pin: text("pin").notNull(),
   color: text("color").notNull(), // avatar hue as hex
   token: text("token").notNull().unique(),
+  shopFor: text("shop_for").$type<ShopFor>(), // nullable; see SHOP_FOR
 });
 export const insertUserSchema = createInsertSchema(users).pick({
   name: true,
@@ -96,6 +105,10 @@ export type InsertSession = z.infer<typeof insertSessionSchema>;
 export type Session = typeof sessions.$inferSelect;
 
 // ---------- Picks (one member's outfit for a session) ----------
+/** Apparent target department of a garment, guessed by vision from style cues. Same values as ShopFor. */
+export const GARMENT_FITS = SHOP_FOR;
+export type GarmentFit = ShopFor;
+
 export interface GarmentItem {
   category: string; // "sports bra", "leggings", "shoes"
   description: string; // "black high-waist 7/8 leggings"
@@ -103,6 +116,17 @@ export interface GarmentItem {
   colorHex: string;
   brandGuess: string | null;
   searchQuery: string;
+  /**
+   * Vision's guess at the department the piece is sold in ("womens" | "mens" | "unisex").
+   * Optional: picks analysed before this field existed have no `fit` and are treated as "unisex".
+   */
+  fit?: GarmentFit;
+  /**
+   * The query actually used for price lookups and the Compare prices / Amazon links, i.e. searchQuery
+   * with a "women's " / "men's " prefix when the pick owner's shopFor (or `fit`) says so. Computed at
+   * read time (server/prices.ts buildShoppingQuery); never stored.
+   */
+  shoppingQuery?: string;
   links: { label: string; url: string }[];
 }
 
