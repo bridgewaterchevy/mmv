@@ -1,12 +1,13 @@
 import { useRef, useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { Camera, Lock, Unlock, ExternalLink, Sparkles, Trash2, Send, Tag } from "lucide-react";
-import type { SessionView, PickView, PublicUser } from "@shared/schema";
+import { Camera, Lock, Unlock, ExternalLink, Sparkles, Trash2, Send, Tag, ChevronDown, ShoppingBag } from "lucide-react";
+import type { SessionView, PickView, PublicUser, GarmentItem } from "@shared/schema";
 import { Page, Avatar, Swatches } from "@/components/shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Drawer, DrawerContent, DrawerHeader, DrawerTitle } from "@/components/ui/drawer";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { apiJson, apiRequest, assetUrl, queryClient } from "@/lib/queryClient";
 import { useAuth } from "@/lib/auth";
@@ -283,6 +284,164 @@ function UploadDialog({ open, onClose, sessionId, hasExisting, onDone }: { open:
   );
 }
 
+// ---------- live prices (GET /api/picks/:id/prices) ----------
+/** One merchant offer for a garment. `price` is null when the provider can't expose it (e.g. Amazon without PA-API). */
+interface PriceOffer {
+  title: string;
+  seller: string;
+  price: number | null;
+  priceText: string | null;
+  url: string;
+  thumbnail?: string | null;
+  source: string;
+}
+interface PricedItem extends GarmentItem {
+  offers: PriceOffer[];
+}
+interface PricesResponse {
+  items: PricedItem[];
+}
+
+const PRICES_STALE_MS = 10 * 60 * 1000;
+
+/** Fetches live offers once per pick; failures (route missing, provider down) degrade to "no offers" rather than an error state. */
+function usePickPrices(pick: PickView | null) {
+  return useQuery<PricesResponse>({
+    queryKey: ["/api/picks", pick?.id, "prices"],
+    enabled: !!pick && pick.items.length > 0,
+    staleTime: PRICES_STALE_MS,
+    gcTime: PRICES_STALE_MS,
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
+}
+
+function isAmazon(o: PriceOffer) {
+  return /amazon/i.test(o.source) || /amazon/i.test(o.seller) || /amazon\./i.test(o.url);
+}
+
+function formatPrice(o: PriceOffer): string | null {
+  if (o.priceText) return o.priceText;
+  if (o.price != null && Number.isFinite(o.price)) {
+    return Number.isInteger(o.price) ? `$${o.price}` : `$${o.price.toFixed(2)}`;
+  }
+  return null;
+}
+
+/** Offers arrive cheapest-first; prefer the first one with a real price so a null-price Amazon row never claims "cheapest". */
+function pickCheapest(offers: PriceOffer[]) {
+  const priced = offers.find((o) => o.price != null);
+  return priced ?? offers[0] ?? null;
+}
+
+function OfferPrice({ offer, className }: { offer: PriceOffer; className?: string }) {
+  const text = formatPrice(offer);
+  if (text) return <span className={className}>{text}</span>;
+  return <span className={cn("text-muted-foreground", className)}>{isAmazon(offer) ? "See price on Amazon" : "See price"}</span>;
+}
+
+function ShopLinks({ links, index }: { links: GarmentItem["links"]; index: number }) {
+  if (!links.length) return null;
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {links.map((l) => (
+        <a key={l.url} href={l.url} target="_blank" rel="noopener noreferrer" className={cn("inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium hover-elevate", l.label === "Compare prices" ? "bg-primary text-primary-foreground" : "bg-secondary text-secondary-foreground")} data-testid={`link-shop-${index}-${l.label}`}>
+          {l.label} <ExternalLink className="h-3 w-3" />
+        </a>
+      ))}
+    </div>
+  );
+}
+
+/** One garment: swatch + description + brand, cheapest offer with Buy, collapsible other prices, and the search/brand chips. */
+function ShopCard({ item, index, pickId, loading }: { item: PricedItem; index: number; pickId: number; loading: boolean }) {
+  const [moreOpen, setMoreOpen] = useState(false);
+  const cheapest = pickCheapest(item.offers);
+  const others = cheapest ? item.offers.filter((o) => o !== cheapest) : [];
+  const cheapestPrice = cheapest ? formatPrice(cheapest) : null;
+
+  return (
+    <li className="rounded-xl border border-card-border bg-card p-3" data-testid={`card-item-${pickId}-${index}`}>
+      <div className="flex items-start gap-2.5">
+        <span className="mt-0.5 h-5 w-5 shrink-0 rounded-full border border-border ring-2 ring-card" style={{ backgroundColor: item.colorHex }} role="img" aria-label={item.colorName} title={item.colorName} />
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-semibold capitalize">
+            {item.category}
+            {item.brandGuess ? <span className="ml-1.5 rounded bg-secondary px-1.5 py-0.5 text-[11px] font-medium normal-case text-secondary-foreground">{item.brandGuess}</span> : null}
+          </p>
+          <p className="text-sm text-muted-foreground">{item.description}</p>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="mt-2.5 flex items-center gap-2.5 rounded-lg bg-muted/60 p-2" data-testid={`skeleton-prices-${index}`} aria-busy="true" aria-label="Loading prices">
+          <Skeleton className="h-12 w-12 shrink-0 rounded-lg bg-muted-foreground/15" />
+          <div className="min-w-0 flex-1 space-y-1.5">
+            <Skeleton className="h-3.5 w-2/3 bg-muted-foreground/15" />
+            <Skeleton className="h-3 w-1/2 bg-muted-foreground/15" />
+          </div>
+          <Skeleton className="h-8 w-14 shrink-0 rounded-md bg-muted-foreground/15" />
+        </div>
+      ) : cheapest ? (
+        <>
+          <div className="mt-2.5 flex items-center gap-2.5 rounded-lg border border-primary/20 bg-primary/5 p-2" data-testid={`row-cheapest-${index}`}>
+            {cheapest.thumbnail ? (
+              <img src={cheapest.thumbnail} alt="" loading="lazy" className="h-12 w-12 shrink-0 rounded-lg bg-muted object-cover" />
+            ) : (
+              <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground"><ShoppingBag className="h-5 w-5" /></span>
+            )}
+            <div className="min-w-0 flex-1">
+              <p className="line-clamp-2 break-words text-sm leading-snug" data-testid={`text-cheapest-${index}`}>
+                {cheapestPrice ? (
+                  <><span className="font-semibold text-primary">Cheapest: {cheapestPrice}</span> <span className="text-muted-foreground">at</span> <span className="font-medium">{cheapest.seller}</span></>
+                ) : (
+                  <><span className="font-medium">{cheapest.seller}</span> <span className="text-muted-foreground">· <OfferPrice offer={cheapest} /></span></>
+                )}
+              </p>
+              <p className="truncate text-xs text-muted-foreground" title={cheapest.title}>{cheapest.title}</p>
+            </div>
+            <Button asChild size="sm" className="shrink-0">
+              <a href={cheapest.url} target="_blank" rel="noopener sponsored" data-testid={`button-buy-${index}`}>Buy <ExternalLink className="h-3.5 w-3.5" /></a>
+            </Button>
+          </div>
+
+          {others.length > 0 && (
+            <Collapsible open={moreOpen} onOpenChange={setMoreOpen} className="mt-1.5">
+              <CollapsibleTrigger asChild>
+                <button type="button" className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs font-medium text-muted-foreground hover-elevate" data-testid={`button-more-prices-${index}`} aria-expanded={moreOpen}>
+                  More prices ({others.length}) <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", moreOpen && "rotate-180")} />
+                </button>
+              </CollapsibleTrigger>
+              <CollapsibleContent>
+                <ul className="mt-1 divide-y divide-border rounded-lg border border-border" data-testid={`list-offers-${index}`}>
+                  {others.map((o, j) => (
+                    <li key={`${o.url}-${j}`}>
+                      <a href={o.url} target="_blank" rel="noopener sponsored" className="flex items-center justify-between gap-3 px-2.5 py-2 text-sm hover-elevate" data-testid={`link-offer-${index}-${j}`}>
+                        <span className="min-w-0">
+                          <span className="block truncate font-medium">{o.seller}</span>
+                          <span className="block truncate text-xs text-muted-foreground">{o.title}</span>
+                        </span>
+                        <OfferPrice offer={o} className="shrink-0 text-sm font-semibold" />
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              </CollapsibleContent>
+            </Collapsible>
+          )}
+
+          <div className="mt-2"><ShopLinks links={item.links} index={index} /></div>
+        </>
+      ) : (
+        <div className="mt-2">
+          <ShopLinks links={item.links} index={index} />
+          <p className="mt-2 text-xs text-muted-foreground" data-testid={`text-prices-soon-${index}`}>Live prices coming soon</p>
+        </div>
+      )}
+    </li>
+  );
+}
+
 // ---------- detail drawer ----------
 function PickDrawer({ pick, onClose, me, onDone }: { pick: PickView | null; onClose: () => void; me: PublicUser; onDone: () => void }) {
   const [comment, setComment] = useState("");
@@ -300,6 +459,13 @@ function PickDrawer({ pick, onClose, me, onDone }: { pick: PickView | null; onCl
   });
 
   const [confirmRemove, setConfirmRemove] = useState(false);
+  const prices = usePickPrices(pick);
+  // Align priced items to the pick's garments by index; anything missing (route not deployed yet, provider down) falls back to no offers.
+  const pricedItems: PricedItem[] = (pick?.items ?? []).map((it, i) => {
+    const p = prices.data?.items?.[i];
+    return { ...it, links: Array.isArray(p?.links) && p.links.length ? p.links : it.links, offers: Array.isArray(p?.offers) ? p.offers : [] };
+  });
+  const pricesLoading = prices.isLoading;
   const mine = pick?.userId === me.id;
   const comments = pick?.reactions.filter((r) => r.comment) ?? [];
   const emojiCounts = EMOJIS.map((e) => ({ e, n: pick?.reactions.filter((r) => r.emoji === e).length ?? 0, me: pick?.reactions.some((r) => r.emoji === e && r.userId === me.id) }));
@@ -334,26 +500,16 @@ function PickDrawer({ pick, onClose, me, onDone }: { pick: PickView | null; onCl
             {pick.items.length === 0 ? (
               <p className="rounded-xl bg-muted p-3 text-sm text-muted-foreground">We couldn't read the pieces in this photo. A clearer, well-lit shot works best.</p>
             ) : (
-              <ul className="space-y-2">
-                {pick.items.map((it, i) => (
-                  <li key={i} className="rounded-xl border border-card-border bg-card p-3" data-testid={`card-item-${pick.id}-${i}`}>
-                    <div className="flex items-start gap-2.5">
-                      <span className="mt-0.5 h-5 w-5 shrink-0 rounded-full ring-2 ring-card" style={{ backgroundColor: it.colorHex }} />
-                      <div className="min-w-0 flex-1">
-                        <p className="text-sm font-semibold capitalize">{it.category}{it.brandGuess ? <span className="ml-1.5 rounded bg-secondary px-1.5 py-0.5 text-[11px] font-medium normal-case text-secondary-foreground">{it.brandGuess}</span> : null}</p>
-                        <p className="text-sm text-muted-foreground">{it.description}</p>
-                        <div className="mt-2 flex flex-wrap gap-1.5">
-                          {it.links.map((l) => (
-                            <a key={l.url} href={l.url} target="_blank" rel="noopener noreferrer" className={cn("inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium hover-elevate", l.label === "Compare prices" ? "bg-primary text-primary-foreground" : "bg-secondary text-secondary-foreground")} data-testid={`link-shop-${i}-${l.label}`}>
-                              {l.label} <ExternalLink className="h-3 w-3" />
-                            </a>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-                  </li>
-                ))}
-              </ul>
+              <>
+                <ul className="space-y-2" data-testid="list-shop-items">
+                  {pricedItems.map((it, i) => (
+                    <ShopCard key={`${pick.id}-${i}`} item={it} index={i} pickId={pick.id} loading={pricesLoading} />
+                  ))}
+                </ul>
+                <p className="mt-2 text-[11px] leading-snug text-muted-foreground" data-testid="text-affiliate-disclosure">
+                  Affiliate links may earn MMV a commission at no extra cost to you. As an Amazon Associate, MMV earns from qualifying purchases.
+                </p>
+              </>
             )}
 
             <h3 className="mb-2 mt-5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Crew notes</h3>

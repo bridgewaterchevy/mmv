@@ -122,6 +122,16 @@ const DDL = [
     comment TEXT
   )`,
   `CREATE INDEX IF NOT EXISTS reactions_pick_idx ON reactions (pick_id)`,
+  // Shopping price lookups (server/prices.ts): 24h cache per normalised query + daily provider-call budget.
+  `CREATE TABLE IF NOT EXISTS price_cache (
+    query TEXT PRIMARY KEY,
+    offers TEXT NOT NULL DEFAULT '[]',
+    fetched_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`,
+  `CREATE TABLE IF NOT EXISTS price_budget (
+    day TEXT PRIMARY KEY,
+    calls INTEGER NOT NULL DEFAULT 0
+  )`,
 ];
 
 async function migrate(db: Db) {

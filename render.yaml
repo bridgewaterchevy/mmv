@@ -42,3 +42,14 @@ services:
         sync: false          # Supabase secret key (sb_secret_...) or legacy service_role JWT. SECRET.
       - key: GEMINI_API_KEY
         sync: false          # Google AI Studio key. SECRET.
+      # Shopping prices + affiliate links (optional; the app works without them, offers are just empty)
+      - key: SERPAPI_KEY
+        sync: false          # SerpApi private key (Google Shopping prices). SECRET.
+      - key: HASDATA_API_KEY
+        sync: false          # HasData key, fallback shopping provider. SECRET. Leave blank to skip.
+      - key: PRICE_LOOKUPS_PER_DAY
+        value: "8"           # provider calls per UTC day (8/day ≈ 240/month fits SerpApi's free 250)
+      - key: SOVRN_API_KEY
+        sync: false          # Sovrn Commerce API key; wraps retailer links for commission. SECRET.
+      - key: AMAZON_ASSOCIATES_TAG
+        sync: false          # Amazon Associates tracking id (e.g. yourstore-20). Not secret, but account-specific.

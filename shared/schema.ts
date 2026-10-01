@@ -1,4 +1,4 @@
-import { pgTable, text, integer, serial, boolean } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, serial, boolean, timestamp } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import type * as z from "zod/mini";
 
@@ -154,3 +154,39 @@ export interface SessionView extends Session {
   members: PublicUser[];
   picks: PickView[];
 }
+
+// ---------- Shopping offers (lazy price lookups, see server/prices.ts) ----------
+export interface Offer {
+  title: string;
+  seller: string; // merchant name as reported by the provider ("Walmart", "lululemon")
+  /**
+   * Price in USD. `null` when the merchant is Amazon: the Associates Program Policies only allow
+   * showing Amazon prices served by Amazon itself or fetched through PA-API / Creators API, so we
+   * hide the number and let the UI say "See price on Amazon" instead.
+   */
+  price: number | null;
+  priceText: string; // display string from the provider ("$92.00") or "See price on Amazon"
+  url: string; // already affiliate-wrapped when the matching key is configured
+  thumbnail?: string;
+  source: "serpapi" | "hasdata";
+}
+
+/** One entry of GET /api/picks/:id/prices → { items: PricedItem[] } */
+export interface PricedItem extends GarmentItem {
+  offers: Offer[];
+}
+
+// Cache of provider results keyed by the normalised (lowercase, trimmed) search query. TTL is
+// enforced in code (server/prices.ts) so stale rows can still be served when providers fail.
+export const priceCache = pgTable("price_cache", {
+  query: text("query").primaryKey(),
+  offers: text("offers").notNull().default("[]"), // JSON Offer[] (unwrapped urls)
+  fetchedAt: timestamp("fetched_at", { withTimezone: true, mode: "date" }).notNull(),
+});
+export type PriceCacheRow = typeof priceCache.$inferSelect;
+
+// Provider calls per UTC day; guards the 250/month free SerpApi quota (PRICE_LOOKUPS_PER_DAY).
+export const priceBudget = pgTable("price_budget", {
+  day: text("day").primaryKey(), // YYYY-MM-DD (UTC)
+  calls: integer("calls").notNull().default(0),
+});

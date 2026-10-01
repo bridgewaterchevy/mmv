@@ -1,0 +1,347 @@
+[
+  {
+    "check": "GET /api/health -> 200 {ok:true}",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "POST /api/auth/signup (user A) -> 200 {token,user}",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "POST /api/auth/signup (user B) -> 200 {token,user}",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "signup response hides pin/token inside user",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "POST /api/auth/signup duplicate handle -> 409",
+    "pass": true,
+    "detail": "HTTP 409"
+  },
+  {
+    "check": "POST /api/auth/login (A, correct PIN) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "GET /api/me (A) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "/api/me returns our handle",
+    "pass": true,
+    "detail": "smoke_a_cjevakhy"
+  },
+  {
+    "check": "GET /api/me without token -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "GET /api/me with bogus token -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "GET /api/crews (A, empty) -> 200 list",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "GET /api/crews returns a list",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "POST /api/crews (A) -> 200 {id,inviteCode,members}",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "new crew has creator as member",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "POST /api/crews invalid activity -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "POST /api/crews/join (B) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "crew now has 2 members",
+    "pass": true,
+    "detail": "2 members"
+  },
+  {
+    "check": "POST /api/crews/join bad code -> 404",
+    "pass": true,
+    "detail": "HTTP 404"
+  },
+  {
+    "check": "GET /api/crews/:id (B) -> 200 {sessions}",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "GET /api/crews/:id unauth -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "GET /api/crews/:id/day/:date (auto-create) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "day session has today's date",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "GET day again (B) -> 200 same session",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "day endpoint is idempotent (same session id)",
+    "pass": true,
+    "detail": "100 vs 100"
+  },
+  {
+    "check": "GET day with bad date -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "PATCH /api/sessions/:id {vibe} -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "vibe saved",
+    "pass": true,
+    "detail": "'all black'"
+  },
+  {
+    "check": "GET /api/sessions/:id (B) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "vibe visible to other member",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "POST /api/sessions/:id/picks JPEG (A) -> 200 (0.6s)",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "pick.items is a list",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "pick.palette is a list",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "pick.note echoed",
+    "pass": true,
+    "detail": "'smoke test fit'"
+  },
+  {
+    "check": "vision: garment recognition (lenient)",
+    "pass": true,
+    "detail": "analysisFailed=true -> vision unavailable (check GEMINI_API_KEY / Render logs for 'vision failed'); items=[] is acceptable"
+  },
+  {
+    "check": "GET photoPath -> 200 image/jpeg bytes",
+    "pass": true,
+    "detail": "http://localhost:5000/uploads/1790851263795-804cda9893b2eaee.jpg HTTP 200 image/jpeg 12308 bytes"
+  },
+  {
+    "check": "photo bytes round-trip identical",
+    "pass": true,
+    "detail": "12308 vs 12308"
+  },
+  {
+    "check": "GET session shows 1 pick after A upload",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "session.picks has 1 entry",
+    "pass": true,
+    "detail": "1"
+  },
+  {
+    "check": "POST picks JPEG (B, no note) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "A and B picks are distinct",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "POST picks .txt (text/plain) -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "POST picks text bytes declared image/jpeg -> 400 (magic-byte sniff)",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "POST picks without photo -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "POST picks without token -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "GET /api/picks/:id/prices (B on A's pick) -> 200 {items}",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "prices: items list mirrors pick.items, each with offers[]",
+    "pass": true,
+    "detail": "items=0, offers=0 (0 offers: no SERPAPI_KEY/HASDATA_API_KEY, budget spent, or no items)"
+  },
+  {
+    "check": "PATCH /api/picks/:id {locked:true} -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "pick is locked",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "PATCH other user's pick -> 404",
+    "pass": true,
+    "detail": "HTTP 404"
+  },
+  {
+    "check": "PATCH pick invalid body -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "PATCH {locked:false} -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "POST reactions {emoji} (B on A) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "emoji reaction present",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "POST reactions {comment} -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "comment reaction present",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "reactions carry user",
+    "pass": true,
+    "detail": ""
+  },
+  {
+    "check": "POST reactions empty -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "GET /api/closet (A) -> 200 list",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "closet is a list containing our pick",
+    "pass": true,
+    "detail": "1"
+  },
+  {
+    "check": "POST /api/auth/login wrong PIN -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "POST /api/auth/login unknown handle -> 401",
+    "pass": true,
+    "detail": "HTTP 401"
+  },
+  {
+    "check": "POST /api/auth/login malformed PIN -> 400",
+    "pass": true,
+    "detail": "HTTP 400"
+  },
+  {
+    "check": "6+ wrong PINs in a row -> 429",
+    "pass": true,
+    "detail": "codes=[401, 401, 401, 401, 401, 429]"
+  },
+  {
+    "check": "correct PIN while locked out -> still 429",
+    "pass": true,
+    "detail": "HTTP 429"
+  },
+  {
+    "check": "DELETE /api/picks/100 (cleanup) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "DELETE /api/picks/100 again -> 404",
+    "pass": true,
+    "detail": "HTTP 404"
+  },
+  {
+    "check": "DELETE /api/picks/101 (cleanup) -> 200",
+    "pass": true,
+    "detail": "HTTP 200"
+  },
+  {
+    "check": "DELETE /api/picks/101 again -> 404",
+    "pass": true,
+    "detail": "HTTP 404"
+  },
+  {
+    "check": "closet empty after cleanup",
+    "pass": true,
+    "detail": "200 []"
+  }
+]

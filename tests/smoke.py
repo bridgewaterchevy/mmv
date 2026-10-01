@@ -13,7 +13,8 @@ What it does (end to end, with two throwaway users):
   health -> signup A/B -> login A -> /api/me -> create crew (A) -> join by invite (B)
   -> GET crew -> GET day (auto-creates session) -> PATCH vibe -> GET session
   -> upload synthetic JPEG as A (checks items/palette/analysisFailed, fetches photoPath)
-  -> upload as B -> .txt upload rejected 400 -> lock/unlock pick -> emoji + comment reactions
+  -> upload as B -> .txt upload rejected 400 -> lazy prices for A's pick (200 {items}; offers may be
+     empty without SERPAPI_KEY/HASDATA_API_KEY) -> lock/unlock pick -> emoji + comment reactions
   -> closet -> wrong PIN 401 -> repeated wrong PINs 429 -> no-token 401 -> delete picks (cleanup).
 
 Exit code 0 only if every check passes. Prints a PASS/FAIL table.
@@ -310,6 +311,24 @@ def run(base):
         expect("POST picks without token -> 401", r, 401)
 
         pid_a = pick_a["id"]
+
+        # ---- lazy shopping prices (offers are [] when no provider key is configured; that's fine)
+        r = api("GET", f"/api/picks/{pid_a}/prices", tok_b, timeout=60)
+        pr = expect("GET /api/picks/:id/prices (B on A's pick) -> 200 {items}", r, 200, ["items"])
+        if pr:
+            items = pr["items"]
+            ok = isinstance(items, list) and len(items) == len(pick_a["items"]) and all(
+                isinstance(i, dict) and isinstance(i.get("offers"), list) and "searchQuery" in i for i in items)
+            n_offers = sum(len(i.get("offers", [])) for i in items) if isinstance(items, list) else 0
+            record("prices: items list mirrors pick.items, each with offers[]", ok,
+                   f"items={len(items) if isinstance(items, list) else items}, offers={n_offers}"
+                   + ("" if n_offers else " (0 offers: no SERPAPI_KEY/HASDATA_API_KEY, budget spent, or no items)"))
+            if n_offers:
+                flat = [o for i in items for o in i["offers"]]
+                check("prices: offers have title/seller/url/priceText/source",
+                      all(all(k in o for k in ("title", "seller", "url", "priceText", "source")) for o in flat))
+                check("prices: Amazon offers never show a number",
+                      all(o.get("price") is None for o in flat if "amazon" in (o.get("seller", "") + o.get("url", "")).lower()))
 
         # ---- lock / unlock
         r = api("PATCH", f"/api/picks/{pid_a}", tok_a, json={"locked": True})

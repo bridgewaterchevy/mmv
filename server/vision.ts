@@ -73,6 +73,8 @@ function geminiTarget(model: string): { url: string; headers: Record<string, str
 }
 
 export async function analyzeOutfit(image: Buffer | string, mimeType: string): Promise<OutfitAnalysis> {
+  // Test hook (tests/test_prices_mock.py): skip Gemini and use a canned analysis.
+  if (process.env.MOCK_VISION_JSON) return normalizeAnalysis(JSON.parse(process.env.MOCK_VISION_JSON));
   const data = (Buffer.isBuffer(image) ? image : fs.readFileSync(image)).toString("base64");
   const mediaType = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"].includes(mimeType) ? mimeType : "image/jpeg";
   const payload = JSON.stringify({
@@ -105,12 +107,10 @@ export async function analyzeOutfit(image: Buffer | string, mimeType: string): P
   const result: GeminiBody = body;
   const text = (result.candidates?.[0]?.content?.parts ?? []).map((p) => p.text ?? "").join("").trim();
   const json = text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1);
-  const parsed = JSON.parse(json) as {
-    summary?: string;
-    palette?: string[];
-    items?: Omit<GarmentItem, "links">[];
-  };
+  return normalizeAnalysis(JSON.parse(json));
+}
 
+function normalizeAnalysis(parsed: { summary?: string; palette?: string[]; items?: Omit<GarmentItem, "links">[] }): OutfitAnalysis {
   const palette = (parsed.palette ?? []).filter((h) => /^#[0-9a-f]{6}$/i.test(h)).slice(0, 4);
   const items: GarmentItem[] = (parsed.items ?? []).slice(0, 6).map((it) => ({
     category: it.category ?? "item",

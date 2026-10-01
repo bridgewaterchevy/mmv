@@ -22,6 +22,7 @@ import type {
 import { and, eq, inArray, desc, asc, count, gte } from "drizzle-orm";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { getDb } from "./db";
+import { wrapItems } from "./affiliate";
 
 export { getDb } from "./db";
 
@@ -219,7 +220,8 @@ export class DatabaseStorage {
     return {
       ...p,
       palette: safeJson<string[]>(p.palette, []),
-      items: safeJson<GarmentItem[]>(p.items, []),
+      // Affiliate wrapping happens here, at read time, so stored picks never need re-processing.
+      items: wrapItems(safeJson<GarmentItem[]>(p.items, [])),
       user,
       reactions: reactionViews,
     };
