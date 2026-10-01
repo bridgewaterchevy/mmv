@@ -14,6 +14,7 @@ import { useAuth } from "@/lib/auth";
 import { useToast } from "@/hooks/use-toast";
 import { formatDate, matchScore, type MatchLevel } from "@/lib/color";
 import { cn } from "@/lib/utils";
+import { formatPrice, isDirect, isLowestPrice, offerSourceLabel, pickHighlightOffer, retailerHost, type PriceOffer } from "@/lib/offers";
 
 const EMOJIS = ["🔥", "😍", "👯‍♀️", "✅"];
 
@@ -285,16 +286,7 @@ function UploadDialog({ open, onClose, sessionId, hasExisting, onDone }: { open:
 }
 
 // ---------- live prices (GET /api/picks/:id/prices) ----------
-/** One merchant offer for a garment. `price` is null when the provider can't expose it (e.g. Amazon without PA-API). */
-interface PriceOffer {
-  title: string;
-  seller: string;
-  price: number | null;
-  priceText: string | null;
-  url: string;
-  thumbnail?: string | null;
-  source: string;
-}
+// Offer shape + highlight rule live in @/lib/offers (pure, unit-testable).
 interface PricedItem extends GarmentItem {
   offers: PriceOffer[];
 }
@@ -317,21 +309,7 @@ function usePickPrices(pick: PickView | null) {
 }
 
 function isAmazon(o: PriceOffer) {
-  return /amazon/i.test(o.source) || /amazon/i.test(o.seller) || /amazon\./i.test(o.url);
-}
-
-function formatPrice(o: PriceOffer): string | null {
-  if (o.priceText) return o.priceText;
-  if (o.price != null && Number.isFinite(o.price)) {
-    return Number.isInteger(o.price) ? `$${o.price}` : `$${o.price.toFixed(2)}`;
-  }
-  return null;
-}
-
-/** Offers arrive cheapest-first; prefer the first one with a real price so a null-price Amazon row never claims "cheapest". */
-function pickCheapest(offers: PriceOffer[]) {
-  const priced = offers.find((o) => o.price != null);
-  return priced ?? offers[0] ?? null;
+  return /amazon/i.test(o.source) || /amazon/i.test(o.seller) || /amazon\./i.test(o.url) || /amazon\./i.test(retailerHost(o));
 }
 
 function OfferPrice({ offer, className }: { offer: PriceOffer; className?: string }) {
@@ -356,9 +334,13 @@ function ShopLinks({ links, index }: { links: GarmentItem["links"]; index: numbe
 /** One garment: swatch + description + brand, cheapest offer with Buy, collapsible other prices, and the search/brand chips. */
 function ShopCard({ item, index, pickId, loading }: { item: PricedItem; index: number; pickId: number; loading: boolean }) {
   const [moreOpen, setMoreOpen] = useState(false);
-  const cheapest = pickCheapest(item.offers);
+  // Highlight rule: cheapest priced offer, unless it's a Google Shopping link and a retailer-direct offer sits within 10% of it.
+  const cheapest = pickHighlightOffer(item.offers);
   const others = cheapest ? item.offers.filter((o) => o !== cheapest) : [];
   const cheapestPrice = cheapest ? formatPrice(cheapest) : null;
+  const cheapestDirect = cheapest ? isDirect(cheapest) : false;
+  // Only call it "Cheapest" when it really is; when the 10% rule promoted a direct offer, say so instead.
+  const highlightLabel = cheapest && isLowestPrice(cheapest, item.offers) ? "Cheapest" : "Buy direct";
 
   return (
     <li className="rounded-xl border border-card-border bg-card p-3" data-testid={`card-item-${pickId}-${index}`}>
@@ -393,15 +375,18 @@ function ShopCard({ item, index, pickId, loading }: { item: PricedItem; index: n
             <div className="min-w-0 flex-1">
               <p className="line-clamp-2 break-words text-sm leading-snug" data-testid={`text-cheapest-${index}`}>
                 {cheapestPrice ? (
-                  <><span className="font-semibold text-primary">Cheapest: {cheapestPrice}</span> <span className="text-muted-foreground">at</span> <span className="font-medium">{cheapest.seller}</span></>
+                  <><span className="font-semibold text-primary">{highlightLabel}: {cheapestPrice}</span> <span className="text-muted-foreground">at</span> <span className="font-medium">{cheapest.seller}</span></>
                 ) : (
                   <><span className="font-medium">{cheapest.seller}</span> <span className="text-muted-foreground">· <OfferPrice offer={cheapest} /></span></>
                 )}
               </p>
+              <p className="truncate text-[11px] leading-tight text-muted-foreground" data-testid={`text-cheapest-source-${index}`}>{offerSourceLabel(cheapest)}</p>
               <p className="truncate text-xs text-muted-foreground" title={cheapest.title}>{cheapest.title}</p>
             </div>
             <Button asChild size="sm" className="shrink-0">
-              <a href={cheapest.url} target="_blank" rel="noopener sponsored" data-testid={`button-buy-${index}`}>Buy <ExternalLink className="h-3.5 w-3.5" /></a>
+              <a href={cheapest.url} target="_blank" rel="noopener sponsored" data-testid={`button-buy-${index}`} data-direct={cheapestDirect ? "true" : "false"} aria-label={cheapestDirect ? `Buy at ${cheapest.seller}` : `Shop ${cheapest.seller} on Google Shopping`}>
+                {cheapestDirect ? "Buy" : "Shop"} <ExternalLink className="h-3.5 w-3.5" />
+              </a>
             </Button>
           </div>
 
@@ -416,12 +401,15 @@ function ShopCard({ item, index, pickId, loading }: { item: PricedItem; index: n
                 <ul className="mt-1 divide-y divide-border rounded-lg border border-border" data-testid={`list-offers-${index}`}>
                   {others.map((o, j) => (
                     <li key={`${o.url}-${j}`}>
-                      <a href={o.url} target="_blank" rel="noopener sponsored" className="flex items-center justify-between gap-3 px-2.5 py-2 text-sm hover-elevate" data-testid={`link-offer-${index}-${j}`}>
+                      <a href={o.url} target="_blank" rel="noopener sponsored" className="flex items-center justify-between gap-3 px-2.5 py-1.5 text-sm hover-elevate" data-testid={`link-offer-${index}-${j}`} data-direct={isDirect(o) ? "true" : "false"}>
                         <span className="min-w-0">
-                          <span className="block truncate font-medium">{o.seller}</span>
-                          <span className="block truncate text-xs text-muted-foreground">{o.title}</span>
+                          <span className="block truncate font-medium leading-snug">{o.seller}</span>
+                          <span className="block truncate text-xs leading-snug text-muted-foreground">{o.title}</span>
                         </span>
-                        <OfferPrice offer={o} className="shrink-0 text-sm font-semibold" />
+                        <span className="flex max-w-[55%] shrink-0 flex-col items-end text-right">
+                          <OfferPrice offer={o} className="text-sm font-semibold leading-snug" />
+                          <span className="max-w-full truncate text-[10px] leading-tight text-muted-foreground" data-testid={`text-offer-source-${index}-${j}`}>{offerSourceLabel(o, { short: true })}</span>
+                        </span>
                       </a>
                     </li>
                   ))}

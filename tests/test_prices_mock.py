@@ -9,7 +9,11 @@ No provider keys, no network: the provider HTTP call is stubbed through MOCK_PRI
 Part 1 runs tests/prices_harness.ts (one Node process, throwaway pglite dir) and asserts:
   parsing (SerpApi + HasData shapes), price sort, seller+title dedupe, cap 6, memo hit,
   DB cache hit, in-flight dedupe, daily budget guard, stale-cache fallback on budget / 429,
-  "no provider -> [] fast", wrapLink (Amazon tag, Sovrn redirect, google skipped), Amazon price masking.
+  "no provider -> [] fast", wrapLink (Amazon tag, Sovrn redirect, google skipped), Amazon price masking,
+  direct retailer links: `link` preferred over product_link, Google ad-redirect (adurl=) unwrapping,
+  direct/retailerHost fields, Immersive Product fallback (MOCK_IMMERSIVE_JSON) resolving only the
+  cheapest non-direct offer, budget accounting (1 unit per resolve), resolved url cached in the same row
+  (fresh-process read = zero provider calls), store choice by seller name / cheapest.
 Part 2 boots the real server on a spare port with the mocks + SOVRN_API_KEY/AMAZON_ASSOCIATES_TAG,
   creates a crew/day/pick and checks GET /api/picks/:id/prices end to end (200 shape, offers,
   wrapped links in both offers and item.links, Amazon masking, 403 for non-members, 401 unauth).
@@ -39,23 +43,45 @@ def check(name, cond, detail=""):
 
 MOCK_SERPAPI = {
     "shopping_results": [
+        # product_link only (google page) + immersive token -> non-direct; NOT the cheapest non-direct, so never resolved (limit 1)
         {"title": 'Align High-Rise Pant 25"', "source": "lululemon", "price": "$98.00", "extracted_price": 98,
-         "product_link": "https://www.google.com/shopping/product/1", "thumbnail": "https://t/1.webp"},
+         "product_link": "https://www.google.com/shopping/product/1", "thumbnail": "https://t/1.webp",
+         "immersive_product_page_token": "tok-lulu",
+         "serpapi_immersive_product_api": "https://serpapi.com/search.json?engine=google_immersive_product&page_token=tok-lulu"},
+        # direct merchant `link` (direct_link=true) wins over product_link
         {"title": "Align Pant Dupe", "source": "Amazon.com", "price": "$29.99", "extracted_price": 29.99,
-         "link": "https://www.amazon.com/dp/B0X"},
+         "link": "https://www.amazon.com/dp/B0X", "product_link": "https://www.google.com/shopping/product/amz"},
         # exact duplicate (seller+title) of the first row -> dropped
         {"title": 'Align High-Rise Pant 25"', "source": "lululemon", "price": "$98.00", "extracted_price": 98,
          "product_link": "https://www.google.com/shopping/product/1b"},
         # no extracted_price -> parsed from the display string; most expensive -> falls off the cap of 6
         {"title": "Align Pant 25 Black", "source": "Nordstrom", "price": "$118", "product_link": "https://www.google.com/shopping/product/2"},
-        # no link at all -> Google Shopping search fallback url
-        {"title": "No link item", "source": "Target", "price": "$45.00", "extracted_price": 45},
+        # no link at all -> Google Shopping search fallback url; cheapest non-direct -> resolved via immersive (token only in the serpapi url)
+        {"title": "No link item", "source": "Target", "price": "$45.00", "extracted_price": 45,
+         "serpapi_immersive_product_api": "https://serpapi.com/search.json?engine=google_immersive_product&page_token=tok-target"},
         {"title": "X1", "source": "S1", "extracted_price": 50, "product_link": "https://www.google.com/shopping/product/3"},
-        {"title": "X2", "source": "S2", "extracted_price": 51, "product_link": "https://www.google.com/shopping/product/4"},
+        # Google ad-click redirect -> adurl extracted -> direct
+        {"title": "X2", "source": "S2", "extracted_price": 51, "product_link": "https://www.google.com/shopping/product/4",
+         "link": "https://www.google.com/aclk?sa=L&ai=DChc&adurl=https%3A%2F%2Fwww.s2shop.com%2Fp%2Fx2%3Fcolor%3Dblack"},
         {"title": "X3", "source": "S3", "extracted_price": 52, "product_link": "https://www.google.com/shopping/product/5"},
         # untitled -> ignored
         {"title": "", "source": "S4", "extracted_price": 1},
     ]
+}
+
+# Immersive Product API bodies keyed by page_token (https://serpapi.com/google-immersive-product-api)
+MOCK_IMMERSIVE = {
+    "tok-target": {"product_results": {"title": "No link item", "stores": [
+        {"name": "Walmart", "link": "https://www.walmart.com/ip/other/2", "price": "$44.00", "extracted_price": 44},
+        {"name": "Target", "link": "https://www.target.com/p/no-link-item/-/A-123", "price": "$45.00", "extracted_price": 45},
+    ]}},
+    "tok-lulu": {"product_results": {"title": "Align", "stores": [
+        {"name": "Nordstrom", "link": "https://www.nordstrom.com/s/align/1", "price": "$98.00", "extracted_price": 98},
+        {"name": "lululemon", "link": "https://shop.lululemon.com/p/womens-leggings/Align-Pant-25", "price": "$98.00", "extracted_price": 98},
+        {"name": "Cheap Shop", "link": "https://cheap.example.com/align", "price": "$80.00", "extracted_price": 80},
+        # a google.* store link is useless as a "direct" url -> ignored
+        {"name": "Google Store", "link": "https://www.google.com/shopping/product/zzz", "price": "$1.00", "extracted_price": 1},
+    ]}},
 }
 
 MOCK_VISION = {
@@ -83,7 +109,8 @@ def run_harness():
     print("Part 1: tests/prices_harness.ts")
     tmp = tempfile.mkdtemp(prefix="mmv-prices-")
     env = {**os.environ, "PGLITE_DIR": os.path.join(tmp, "pglite"), "MOCK_PRICES_JSON": json.dumps(MOCK_SERPAPI),
-           "PRICE_LOOKUPS_PER_DAY": "8"}
+           "MOCK_IMMERSIVE_JSON": json.dumps(MOCK_IMMERSIVE), "PRICE_LOOKUPS_PER_DAY": "8"}
+    env.pop("PRICE_DIRECT_RESOLVE_PER_ITEM", None)
     for k in ("SERPAPI_KEY", "HASDATA_API_KEY", "SOVRN_API_KEY", "AMAZON_ASSOCIATES_TAG", "DATABASE_URL", "SUPABASE_DB_PASSWORD"):
         env.pop(k, None)
     try:
@@ -108,21 +135,59 @@ def run_harness():
     check("parse: missing link -> google shopping search url", any("udm=28" in u for u in p["urls"]), p["urls"])
     check("parse: thumbnail carried through", "https://t/1.webp" in p["thumbnails"], p["thumbnails"])
     check("parse: source tagged serpapi", p["sources"] == ["serpapi"], p["sources"])
+    check("parse: Google ad redirect (aclk?adurl=) unwrapped to merchant url", "https://www.s2shop.com/p/x2?color=black" in p["urls"], p["urls"])
+    # order after sort: Amazon 29.99 (direct), Target 45 (google search), S1 50, S2 51 (adurl direct), S3 52, lululemon 98
+    check("parse: direct flag = url host not google.*", p["direct"] == [True, False, False, True, False, False], p["direct"])
+    check("parse: retailerHost strips www., empty for google", p["hosts"] == ["amazon.com", "", "", "s2shop.com", "", ""], p["hosts"])
+    check("parse: immersive token from field or from serpapi_immersive_product_api url", p["tokens"][1] == "tok-target" and p["tokens"][5] == "tok-lulu" and p["tokens"][2] is None, p["tokens"])
+    check("defaults: PRICE_LOOKUPS_PER_DAY=12, PRICE_DIRECT_RESOLVE_PER_ITEM=1", r["defaults"] == {"budget": 12, "resolvePerItem": 1}, r["defaults"])
+    a = r["adurl"]
+    check("normalizeOfferUrl: google.com/aclk adurl= extracted (decoded)", a["aclk"] == "https://shop.lululemon.com/p/align?color=black&sz=6", a["aclk"])
+    check("normalizeOfferUrl: googleadservices.com/pagead/aclk adurl= extracted", a["adservices"] == "https://www.nordstrom.com/s/123", a["adservices"])
+    check("normalizeOfferUrl: retailer / google product page / aclk without adurl untouched",
+          a["plain"] == "https://www.walmart.com/ip/1?x=1" and a["productPage"] == "https://www.google.com/shopping/product/1" and a["noAdurl"].startswith("https://www.google.com/aclk"), a)
+    check("parse: HasData offers are direct:false with empty retailerHost (google search url)", r["hasdataDirect"] == [[False, "", True]], r["hasdataDirect"])
     h = r["hasdata"]
     check("parse: HasData shoppingResults (extractedPrice/source/thumbnail)",
           h[0]["price"] == 419 and h[0]["seller"] == "Walmart - Seller" and h[0]["source"] == "hasdata" and h[1]["price"] is None, h)
 
-    check("lookup: first call hits provider, budget=1", r["lookup1"]["from"] == "provider" and r["lookup1"]["budget"] == 1, r["lookup1"])
+    l1 = r["lookup1"]
+    check("lookup: first call hits provider + 1 immersive resolve, budget=2", l1["from"] == "provider" and l1["budget"] == 2 and l1["resolved"] == 1, {k: v for k, v in l1.items() if k != "offers"})
+    by_seller = {o["seller"]: o for o in l1["offers"]}
+    tgt, lulu, amz = by_seller.get("Target"), by_seller.get("lululemon"), by_seller.get("Amazon.com")
+    check("resolve: cheapest non-direct offer (Target $45) resolved to the matching store's merchant url",
+          tgt and tgt["url"] == "https://www.target.com/p/no-link-item/-/A-123" and tgt["direct"] is True and tgt["retailerHost"] == "target.com", tgt)
+    check("resolve: pricier non-direct offer (lululemon $98) NOT resolved (limit 1), keeps google product_link",
+          lulu and lulu["url"] == "https://www.google.com/shopping/product/1" and lulu["direct"] is False and lulu["token"] == "tok-lulu", lulu)
+    check("resolve: offers with a direct `link` untouched", amz and amz["url"] == "https://www.amazon.com/dp/B0X" and amz["direct"] is True, amz)
+    check("lookup: still 6 offers, cheapest first", l1["count"] == 6 and [o["price"] for o in l1["offers"]] == sorted(o["price"] for o in l1["offers"]), [o["price"] for o in l1["offers"]])
     check("lookup: query normalised (lowercase/trim/collapse spaces)", r["lookup1"]["key"] == "lululemon align legging black", r["lookup1"]["key"])
-    check("cache: same query -> in-process memo, no provider call", r["lookup2"]["from"] == "memo" and r["lookup2"]["budget"] == 1, r["lookup2"])
-    check("cache: fresh process -> DB cache hit, no provider call", r["lookup3"]["from"] == "db" and r["lookup3"]["budget"] == 1, r["lookup3"])
-    check("cache: concurrent identical lookups share one provider call", r["concurrent"]["budget"] == 2, r["concurrent"])
-    check("budget: spent -> new query returns [] without provider call", r["budget"]["from"] == "budget" and r["budget"]["count"] == 0 and r["budget"]["budget"] == 2, r["budget"])
+    check("cache: same query -> in-process memo, no provider call", r["lookup2"]["from"] == "memo" and r["lookup2"]["budget"] == 2, r["lookup2"])
+    check("cache: fresh process -> DB cache hit, zero provider calls (budget still 2)", r["lookup3"]["from"] == "db" and r["lookup3"]["budget"] == 2, r["lookup3"])
+    check("cache: resolved merchant url persisted in the price_cache row", "https://www.target.com/p/no-link-item/-/A-123" in r["lookup3"]["urls"] and r["lookup3"]["direct"].count(True) == 3, r["lookup3"])
+    check("cache: concurrent identical lookups share one provider call (+1 resolve)", r["concurrent"]["budget"] == 4, r["concurrent"])
+    check("budget: spent -> new query returns [] without provider call", r["budget"]["from"] == "budget" and r["budget"]["count"] == 0 and r["budget"]["budget"] == 4, r["budget"])
     check("budget: cached query still served when budget spent", r["budgetCached"]["from"] == "db" and r["budgetCached"]["count"] == 6, r["budgetCached"])
     check("stale: expired cache served when budget spent", r["staleBudget"]["from"] == "stale" and r["staleBudget"]["count"] == 6, r["staleBudget"])
     check("stale: expired cache served when provider returns 429", r["staleQuota"]["from"] == "stale" and r["staleQuota"]["count"] == 6 and "run out" in (r["staleQuota"]["error"] or ""), r["staleQuota"])
     check("fail: provider 429 + no cache -> []", r["failNoCache"]["from"] == "none" and r["failNoCache"]["count"] == 0, r["failNoCache"])
     check("no provider configured -> [] quickly, budget untouched", r["noProvider"]["count"] == 0 and r["noProvider"]["ms"] < 500 and r["noProvider"]["budgetDelta"] == 0, r["noProvider"])
+
+    im = r["immersive"]
+    check("immersive: stores parsed, google.* store links dropped", im["storeCount"] == 3 and all("google." not in u for u in im["links"]), im)
+    check("immersive: store matching offer.seller preferred", im["bySeller"] == "https://shop.lululemon.com/p/womens-leggings/Align-Pant-25", im["bySeller"])
+    check("immersive: seller 'Nordstrom - Seller' matches store 'Nordstrom'", im["bySellerSuffix"] == "https://www.nordstrom.com/s/align/1", im["bySellerSuffix"])
+    check("immersive: unknown seller -> cheapest store", im["cheapestWhenUnknown"] == "https://cheap.example.com/align", im["cheapestWhenUnknown"])
+    check("immersive: empty body -> no stores", im["emptyBody"] == 0)
+    check("resolve: budget spent -> no call, google url kept (direct:false)", r["resolveNoBudget"] == {"calls": 0, "direct": False, "url": "https://www.google.com/shopping/product/1"}, r["resolveNoBudget"])
+    rl = r["resolveLimit2"]
+    by_title = {o["title"]: o for o in rl["offers"]}
+    check("resolve: limit 2 -> exactly 2 calls charged to budget", rl["calls"] == 2 and rl["budgetDelta"] == 2, rl)
+    check("resolve: cheapest two non-direct (B $45, A $98) resolved; C $120 left; direct D untouched",
+          by_title["B"]["direct"] and by_title["B"]["host"] == "target.com" and by_title["A"]["direct"] and by_title["A"]["host"] == "shop.lululemon.com"
+          and not by_title["C"]["direct"] and by_title["D"]["host"] == "walmart.com", rl["offers"])
+    check("resolve: immersive 429 -> charged once, google url kept, no throw", r["resolveQuota"] == {"calls": 1, "direct": False}, r["resolveQuota"])
+    check("sort: equal prices -> direct offer first", r["tieSort"] == ["d", "g"], r["tieSort"])
 
     w = r["wrap"]
     check("wrapLink: unchanged when no keys", w["unchangedNoKeys"] == ["https://www.amazon.com/dp/B0ABC?tag=old-20&ref=x", "https://shop.lululemon.com/p/leggings/Align-Pant?color=black"], w["unchangedNoKeys"])
@@ -145,6 +210,9 @@ def run_harness():
     check("presentOffers: amazon host -> price null + 'See price on Amazon' + tag", am and am["price"] is None and am["priceText"] == "See price on Amazon" and "tag=mmv-20" in am["url"], pr)
     check("presentOffers: seller 'Amazon…' masked even on google link", gl and gl["price"] is None and gl["priceText"] == "See price on Amazon", pr)
     check("presentOffers: other retailer keeps price, Sovrn-wrapped, listed first", wm and wm["price"] == 12 and pr[0] is wm, pr)
+    check("presentOffers: direct/retailerHost computed before wrapping (walmart.com, not redirect.viglink.com)", wm and wm["direct"] is True and wm["retailerHost"] == "walmart.com", wm)
+    check("presentOffers: google link -> direct:false, retailerHost ''", gl and gl["direct"] is False and gl["retailerHost"] == "", gl)
+    check("presentOffers: immersiveToken never sent to the client", all(o["hasToken"] is False for o in pr), pr)
 
 
 # --------------------------------------------------------------------------- part 2: server
@@ -159,8 +227,9 @@ def run_server_test():
     base = f"http://127.0.0.1:{port}"
     tmp = tempfile.mkdtemp(prefix="mmv-prices-srv-")
     env = {**os.environ, "PORT": str(port), "NODE_ENV": "development", "PGLITE_DIR": os.path.join(tmp, "pglite"),
-           "MOCK_PRICES_JSON": json.dumps(MOCK_SERPAPI), "MOCK_VISION_JSON": json.dumps(MOCK_VISION),
+           "MOCK_PRICES_JSON": json.dumps(MOCK_SERPAPI), "MOCK_IMMERSIVE_JSON": json.dumps(MOCK_IMMERSIVE), "MOCK_VISION_JSON": json.dumps(MOCK_VISION),
            "SOVRN_API_KEY": "sovrn-test", "AMAZON_ASSOCIATES_TAG": "mmvtest-20", "PRICE_LOOKUPS_PER_DAY": "8"}
+    env.pop("PRICE_DIRECT_RESOLVE_PER_ITEM", None)
     for k in ("SERPAPI_KEY", "HASDATA_API_KEY", "DATABASE_URL", "SUPABASE_DB_PASSWORD", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "GEMINI_API_KEY"):
         env.pop(k, None)
     # Dev mode (vite middleware) so no client build is needed; the DB is a throwaway pglite dir and
@@ -226,7 +295,17 @@ def run_server_test():
         check("prices: Amazon offer masked ('See price on Amazon', price null, tag added)", am and am[0]["price"] is None and am[0]["priceText"] == "See price on Amazon" and "tag=mmvtest-20" in am[0]["url"], am)
         others = [o for o in offers if o["seller"] != "Amazon.com"]
         check("prices: non-Amazon offers keep numeric price + priceText", all(isinstance(o["price"], (int, float)) and o["priceText"] for o in others), [(o["seller"], o["price"], o["priceText"]) for o in others])
-        check("prices: google product links not Sovrn-wrapped (not a retailer)", all(o["url"].startswith("https://www.google.com/") for o in others), [o["url"] for o in others])
+        direct = [o for o in others if o["direct"]]
+        indirect = [o for o in others if not o["direct"]]
+        check("prices: every offer carries direct + retailerHost, no immersiveToken", all("direct" in o and "retailerHost" in o and "immersiveToken" not in o for o in offers), [list(o.keys()) for o in offers])
+        check("prices: direct retailer offers Sovrn-wrapped, retailerHost = merchant host",
+              len(direct) == 2 and all(o["url"].startswith("https://redirect.viglink.com?key=sovrn-test&u=") for o in direct) and sorted(o["retailerHost"] for o in direct) == ["s2shop.com", "target.com"],
+              [(o["seller"], o["url"], o["retailerHost"]) for o in direct])
+        check("prices: Target offer resolved via immersive fallback -> target.com inside the Sovrn u=",
+              any(urllib.parse.parse_qs(urllib.parse.urlparse(o["url"]).query).get("u", [""])[0] == "https://www.target.com/p/no-link-item/-/A-123" for o in direct), [o["url"] for o in direct])
+        check("prices: google product links not Sovrn-wrapped (not a retailer), direct:false, retailerHost ''",
+              len(indirect) == 3 and all(o["url"].startswith("https://www.google.com/") and o["retailerHost"] == "" for o in indirect), [o["url"] for o in indirect])
+        check("prices: Amazon masked offer still direct:true/amazon.com", am and am[0]["direct"] is True and am[0]["retailerHost"] == "amazon.com", am)
         check("prices: offers tagged source=serpapi", all(o["source"] == "serpapi" for o in offers))
         check("prices: item.links affiliate-wrapped in prices response too", any("tag=mmvtest-20" in l["url"] for l in items[0]["links"]))
 

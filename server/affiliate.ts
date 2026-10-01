@@ -1,4 +1,5 @@
 import type { GarmentItem, Offer } from "@shared/schema";
+import { decorateOffer } from "./prices";
 
 /**
  * Affiliate link wrapping. Applied at RESPONSE time (storage.pickView and the prices route), never
@@ -87,7 +88,10 @@ export function wrapItems<T extends GarmentItem>(items: T[], cfg?: AffiliateConf
  * Our prices come from Google Shopping providers, so for Amazon offers we null the number.
  */
 export function presentOffers(offers: Offer[], cfg?: AffiliateConfig): Offer[] {
-  const out = offers.map((o) => {
+  const out = offers.map((raw) => {
+    // direct / retailerHost are computed from the retailer url BEFORE wrapping (a Sovrn redirect would
+    // otherwise read as redirect.viglink.com). The immersive token is server-internal, never sent.
+    const { immersiveToken: _token, ...o } = decorateOffer(raw);
     const amazon = isAmazonUrl(o.url) || /\bamazon\b/i.test(o.seller);
     return {
       ...o,
@@ -96,6 +100,7 @@ export function presentOffers(offers: Offer[], cfg?: AffiliateConfig): Offer[] {
       priceText: amazon ? "See price on Amazon" : o.priceText,
     };
   });
-  // Priced offers first (already ascending), unpriced/masked ones after. Stable sort keeps provider order otherwise.
+  // Priced offers first (already ascending, direct-first among ties), unpriced/masked ones after.
+  // Stable sort keeps provider order otherwise.
   return out.sort((a, b) => Number(a.price == null) - Number(b.price == null));
 }

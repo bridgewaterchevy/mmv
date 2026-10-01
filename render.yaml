@@ -48,7 +48,9 @@ services:
       - key: HASDATA_API_KEY
         sync: false          # HasData key, fallback shopping provider. SECRET. Leave blank to skip.
       - key: PRICE_LOOKUPS_PER_DAY
-        value: "8"           # provider calls per UTC day (8/day ≈ 240/month fits SerpApi's free 250)
+        value: "8"          # provider calls per UTC day incl. direct-link resolves (8/day ≈ 240/month fits the free SerpApi plan; 24h cache keeps real usage lower)
+      - key: PRICE_DIRECT_RESOLVE_PER_ITEM
+        value: "1"           # Immersive Product resolves per item for offers lacking a merchant link (1 budget unit each)
       - key: SOVRN_API_KEY
         sync: false          # Sovrn Commerce API key; wraps retailer links for commission. SECRET.
       - key: AMAZON_ASSOCIATES_TAG

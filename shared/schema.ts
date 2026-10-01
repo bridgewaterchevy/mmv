@@ -167,8 +167,18 @@ export interface Offer {
   price: number | null;
   priceText: string; // display string from the provider ("$92.00") or "See price on Amazon"
   url: string; // already affiliate-wrapped when the matching key is configured
+  /**
+   * true when `url` points at the retailer itself (host is not google.*). false for Google Shopping
+   * product pages / searches, which are what SerpApi returns when no merchant `link` is available
+   * and the Immersive Product fallback could not resolve one (see server/prices.ts).
+   */
+  direct: boolean;
+  /** Retailer hostname without "www." ("lululemon.com"), computed from the url BEFORE affiliate wrapping. "" when unknown. */
+  retailerHost: string;
   thumbnail?: string;
   source: "serpapi" | "hasdata";
+  /** SerpApi `immersive_product_page_token`; kept in price_cache so a later resolve needs no new search. Stripped from API responses. */
+  immersiveToken?: string;
 }
 
 /** One entry of GET /api/picks/:id/prices → { items: PricedItem[] } */
