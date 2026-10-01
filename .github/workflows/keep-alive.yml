@@ -31,7 +31,8 @@ jobs:
     steps:
       - name: Ping /api/health (wakes Render; touches Supabase if the health route queries the DB)
         env:
-          APP_URL: ${{ vars.APP_URL }}
+          # Repository variable APP_URL overrides; otherwise the Render hostname below is used.
+          APP_URL: ${{ vars.APP_URL || 'mmv-uhw1.onrender.com' }}
         run: |
           if [ -z "$APP_URL" ]; then
             echo "Repository variable APP_URL is not set." >&2
