@@ -10,7 +10,7 @@ Usage:
 Dependencies: Python 3.8+, `requests`, `Pillow` (pip install requests pillow).
 
 What it does (end to end, with two throwaway users):
-  health -> signup A/B -> login A -> /api/me -> create crew (A) -> join by invite (B)
+  health -> signup A/B (A with shopFor) -> login A -> /api/me -> PATCH /api/me {shopFor} -> create crew (A) -> join by invite (B)
   -> GET crew -> GET day (auto-creates session) -> PATCH vibe -> GET session
   -> upload synthetic JPEG as A (checks items/palette/analysisFailed, fetches photoPath)
   -> upload as B -> .txt upload rejected 400 -> lazy prices for A's pick (200 {items}; offers may be
@@ -151,8 +151,10 @@ def run(base):
         # ---- signup A and B
         handle_a, handle_b = rand_handle("smoke_a_"), rand_handle("smoke_b_")
         pin_a, pin_b = "1234", "4321"
-        r = api("POST", "/api/auth/signup", json={"name": "Smoke A", "handle": handle_a, "pin": pin_a})
-        a = expect("POST /api/auth/signup (user A) -> 200 {token,user}", r, 200, ["token", "user"])
+        r = api("POST", "/api/auth/signup", json={"name": "Smoke A", "handle": handle_a, "pin": pin_a, "shopFor": "womens"})
+        a = expect("POST /api/auth/signup (user A, shopFor=womens) -> 200 {token,user}", r, 200, ["token", "user"])
+        if a:
+            check("signup echoes user.shopFor='womens'", a["user"].get("shopFor") == "womens", repr(a["user"].get("shopFor")))
         r = api("POST", "/api/auth/signup", json={"name": "Smoke B", "handle": handle_b, "pin": pin_b})
         b = expect("POST /api/auth/signup (user B) -> 200 {token,user}", r, 200, ["token", "user"])
         if not a or not b:
@@ -177,10 +179,31 @@ def run(base):
         me = expect("GET /api/me (A) -> 200", r, 200, ["id", "name", "handle", "color"])
         if me:
             check("/api/me returns our handle", me["handle"].lower() == handle_a.lower(), me["handle"])
+            check("/api/me carries shopFor", "shopFor" in me and me["shopFor"] == "womens", repr(me.get("shopFor")))
         r = api("GET", "/api/me")
         expect("GET /api/me without token -> 401", r, 401)
         r = api("GET", "/api/me", "not-a-real-token")
         expect("GET /api/me with bogus token -> 401", r, 401)
+
+        # ---- PATCH /api/me { shopFor }  ("womens" | "mens" | "unisex" | null)
+        r = api("PATCH", "/api/me", tok_a, json={"shopFor": "mens"})
+        pm = expect("PATCH /api/me {shopFor:'mens'} -> 200 PublicUser", r, 200, ["id", "handle", "shopFor"])
+        if pm:
+            check("PATCH /api/me saved shopFor='mens' (no pin/token leaked)", pm["shopFor"] == "mens" and "pin" not in pm and "token" not in pm, repr(pm.get("shopFor")))
+        r = api("GET", "/api/me", tok_a)
+        me2 = expect("GET /api/me after PATCH -> 200", r, 200, ["shopFor"])
+        if me2:
+            check("GET /api/me reflects shopFor='mens'", me2["shopFor"] == "mens", repr(me2.get("shopFor")))
+        r = api("PATCH", "/api/me", tok_a, json={"shopFor": "kids"})
+        expect("PATCH /api/me invalid shopFor -> 400", r, 400)
+        r = api("PATCH", "/api/me", json={"shopFor": "mens"})
+        expect("PATCH /api/me without token -> 401", r, 401)
+        r = api("PATCH", "/api/me", tok_a, json={"shopFor": None})
+        pm = expect("PATCH /api/me {shopFor:null} -> 200 (cleared)", r, 200, ["id"])
+        if pm:
+            check("shopFor cleared to null", pm.get("shopFor") is None, repr(pm.get("shopFor")))
+        r = api("PATCH", "/api/me", tok_a, json={"shopFor": "womens"})
+        expect("PATCH /api/me {shopFor:'womens'} -> 200 (restored)", r, 200, ["id"])
 
         # ---- crews
         r = api("GET", "/api/crews", tok_a)
@@ -318,7 +341,13 @@ def run(base):
         if pr:
             items = pr["items"]
             ok = isinstance(items, list) and len(items) == len(pick_a["items"]) and all(
-                isinstance(i, dict) and isinstance(i.get("offers"), list) and "searchQuery" in i for i in items)
+                isinstance(i, dict) and isinstance(i.get("offers"), list) and "searchQuery" in i and "shoppingQuery" in i for i in items)
+            if isinstance(items, list) and items:
+                # owner A shops womens -> every query is hinted unless it already names a department
+                check("prices: shoppingQuery hinted with women's (owner shopFor) unless already gendered",
+                      all(i["shoppingQuery"].startswith("women's ") or re.search(r"\b((wo)?m[ae]n('?s)?|ladies|girls?|boys?|unisex)\b", i["shoppingQuery"], re.I)
+                          for i in items if i.get("searchQuery")),
+                      [i.get("shoppingQuery") for i in items])
             n_offers = sum(len(i.get("offers", [])) for i in items) if isinstance(items, list) else 0
             record("prices: items list mirrors pick.items, each with offers[]", ok,
                    f"items={len(items) if isinstance(items, list) else items}, offers={n_offers}"

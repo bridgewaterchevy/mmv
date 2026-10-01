@@ -6,10 +6,10 @@ import { sql } from "drizzle-orm";
 import { storage, toPublic, verifyPin, getDb } from "./storage";
 import { files, removeUpload } from "./files";
 import { analyzeOutfit } from "./vision";
-import { lookupOffers } from "./prices";
+import { lookupOffers, buildShoppingQuery } from "./prices";
 import { presentOffers } from "./affiliate";
 import type { User, PricedItem } from "@shared/schema";
-import { ACTIVITIES } from "@shared/schema";
+import { ACTIVITIES, SHOP_FOR } from "@shared/schema";
 
 // ---- tiny in-memory rate limiter (per key, sliding window) ----
 const buckets = new Map<string, number[]>();
@@ -68,6 +68,8 @@ const handleSchema = z
   .max(20)
   .regex(/^[a-z0-9_]+$/i, "Letters, numbers and underscores only");
 const pinSchema = z.string().regex(/^\d{4}$/, "PIN must be 4 digits");
+// "womens" | "mens" | "unisex" | null. Optional on signup; PATCH /api/me requires the key (null clears it).
+const shopForSchema = z.enum(SHOP_FOR, { message: "shopFor must be womens, mens or unisex" }).nullable();
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   // Boot order: database (creates tables) then file store (creates bucket if needed).
@@ -90,10 +92,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // ---------- auth ----------
   app.post("/api/auth/signup", async (req, res) => {
     if (limited(`signup:${ip(req)}`, 10, 60 * 60 * 1000)) return res.status(429).json({ message: "Too many sign-ups from this network. Try again later." });
-    const body = z.object({ name: z.string().min(1).max(40), handle: handleSchema, pin: pinSchema }).safeParse(req.body);
+    const body = z
+      .object({ name: z.string().min(1).max(40), handle: handleSchema, pin: pinSchema, shopFor: shopForSchema.optional() })
+      .safeParse(req.body);
     if (!body.success) return res.status(400).json({ message: body.error.issues[0]?.message ?? "Invalid" });
     if (await storage.getUserByHandle(body.data.handle)) return res.status(409).json({ message: "That handle is taken" });
-    const user = await storage.createUser(body.data);
+    const user = await storage.createUser({ ...body.data, shopFor: body.data.shopFor ?? null });
     res.json({ token: user.token, user: toPublic(user) });
   });
 
@@ -110,6 +114,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get("/api/me", requireAuth, async (req, res) => {
     res.json(toPublic((req as AuthedRequest).user));
+  });
+
+  // Profile preferences. Body: { shopFor: "womens" | "mens" | "unisex" | null }. Returns the updated PublicUser.
+  app.patch("/api/me", requireAuth, async (req, res) => {
+    const body = z.object({ shopFor: shopForSchema }).safeParse(req.body);
+    if (!body.success) return res.status(400).json({ message: body.error.issues[0]?.message ?? "Invalid" });
+    const user = await storage.updateUser((req as AuthedRequest).user.id, { shopFor: body.data.shopFor });
+    res.json(toPublic(user));
   });
 
   // ---------- crews ----------
@@ -261,6 +273,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // Lazy shopping prices for a pick: called when a member opens the pick, never at upload.
   // Looks up the first 4 items concurrently (each lookup is cached 24h and budget-guarded in server/prices.ts).
+  // The query carries a women's/men's hint from the PICK OWNER's shopFor (the outfit is theirs), else the
+  // garment's vision `fit` — see buildShoppingQuery. The hinted string is the price_cache key.
   app.get("/api/picks/:id/prices", requireAuth, async (req, res) => {
     const pick = await storage.getPick(Number(req.params.id));
     const user = (req as AuthedRequest).user;
@@ -268,10 +282,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const s = await storage.getSession(pick.sessionId);
     if (!s || !(await storage.isMember(s.crewId, user.id))) return res.status(403).json({ message: "Not your crew" });
     if (limited(`prices:${user.id}`, 120, 60 * 60 * 1000)) return res.status(429).json({ message: "Slow down a little." });
-    const view = await storage.pickView(pick); // items already affiliate-wrapped
+    const view = await storage.pickView(pick); // items already hinted (shoppingQuery) + affiliate-wrapped
     const offerLists = await Promise.all(
       view.items.slice(0, 4).map((it) =>
-        lookupOffers(it.searchQuery || `${it.colorName} ${it.description}`.trim()).catch((err) => {
+        lookupOffers(it.shoppingQuery || buildShoppingQuery(it, view.user)).catch((err) => {
           console.error("prices lookup failed", err);
           return [];
         }),

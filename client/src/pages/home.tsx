@@ -15,6 +15,7 @@ import { apiJson, queryClient } from "@/lib/queryClient";
 import { useAuth } from "@/lib/auth";
 import { useToast } from "@/hooks/use-toast";
 import { formatDate } from "@/lib/color";
+import { AccountMenu, InstallHint } from "@/components/preferences";
 
 
 export default function Home() {
@@ -22,7 +23,15 @@ export default function Home() {
   const crews = useQuery<CrewView[]>({ queryKey: ["/api/crews"] });
 
   return (
-    <Page title={<Logo />} action={<NewCrewButton />}>
+    <Page
+      title={<Logo />}
+      action={
+        <div className="flex items-center gap-2">
+          <AccountMenu />
+          <NewCrewButton />
+        </div>
+      }
+    >
       <p className="mb-4 text-sm text-muted-foreground" data-testid="text-greeting">
         Hey {user?.name}. {crews.data?.length ? "Here's who's wearing what." : "Start a crew or join one with a code."}
       </p>
@@ -39,6 +48,7 @@ export default function Home() {
           <p className="font-semibold">No crews yet</p>
           <p className="mb-4 text-sm text-muted-foreground">A crew is the group you get dressed for: your 6am class, run club, Saturday doubles.</p>
           <NewCrewButton primary />
+          <InstallHint className="mt-5 text-left" />
         </div>
       )}
 

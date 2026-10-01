@@ -18,11 +18,13 @@ import type {
   Reaction,
   ReactionView,
   GarmentItem,
+  ShopFor,
 } from "@shared/schema";
 import { and, eq, inArray, desc, asc, count, gte } from "drizzle-orm";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { getDb } from "./db";
 import { wrapItems } from "./affiliate";
+import { applyShoppingHints } from "./prices";
 
 export { getDb } from "./db";
 
@@ -73,7 +75,7 @@ export class DatabaseStorage {
     const rows = await db.select().from(users).where(inArray(users.id, ids));
     return rows.map(toPublic);
   }
-  async createUser(data: { name: string; handle: string; pin: string }): Promise<User> {
+  async createUser(data: { name: string; handle: string; pin: string; shopFor?: ShopFor | null }): Promise<User> {
     const db = await getDb();
     const [{ value: n }] = await db.select({ value: count() }).from(users);
     const [row] = await db
@@ -84,8 +86,20 @@ export class DatabaseStorage {
         pin: hashPin(data.pin),
         color: AVATAR_COLORS[Number(n) % AVATAR_COLORS.length],
         token: code(24),
+        shopFor: data.shopFor ?? null,
       })
       .returning();
+    return row;
+  }
+  async updateUser(id: number, data: { shopFor?: ShopFor | null }): Promise<User> {
+    const db = await getDb();
+    const set: Partial<typeof users.$inferInsert> = {};
+    if (data.shopFor !== undefined) set.shopFor = data.shopFor;
+    if (Object.keys(set).length === 0) {
+      const [row] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+      return row;
+    }
+    const [row] = await db.update(users).set(set).where(eq(users.id, id)).returning();
     return row;
   }
 
@@ -220,8 +234,11 @@ export class DatabaseStorage {
     return {
       ...p,
       palette: safeJson<string[]>(p.palette, []),
-      // Affiliate wrapping happens here, at read time, so stored picks never need re-processing.
-      items: wrapItems(safeJson<GarmentItem[]>(p.items, [])),
+      // Read-time decoration, so stored picks never need re-processing:
+      //   1. department hint from the pick OWNER's shopFor (else the garment's `fit`) → shoppingQuery +
+      //      hinted Compare prices / Amazon links (server/prices.ts applyShoppingHints)
+      //   2. affiliate wrapping (server/affiliate.ts), after the urls are final.
+      items: wrapItems(applyShoppingHints(safeJson<GarmentItem[]>(p.items, []), user)),
       user,
       reactions: reactionViews,
     };

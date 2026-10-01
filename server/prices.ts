@@ -1,7 +1,8 @@
 import { eq, sql } from "drizzle-orm";
 import { priceCache, priceBudget } from "@shared/schema";
-import type { Offer } from "@shared/schema";
+import type { Offer, GarmentItem, ShopFor } from "@shared/schema";
 import { getDb } from "./db";
+import { buildLinks } from "./vision";
 
 export type { Offer } from "@shared/schema";
 
@@ -75,6 +76,77 @@ export class ProviderError extends Error {
 
 export function normalizeQuery(q: string): string {
   return q.toLowerCase().trim().replace(/\s+/g, " ");
+}
+
+// ---------------------------------------------------------------- shopping query (department hint)
+
+/**
+ * Words that already pin a query to a department, so we must not prefix another one.
+ * Word-bounded: "men" does not match inside "women", but "women", "women's", "womens", "ladies",
+ * "girls", "boys", "female", "male" and "unisex" all count.
+ */
+const DEPARTMENT_WORD = /\b(?:wo)?m[ae]n(?:'?s)?\b|\blad(?:y|ies)\b|\bgirls?\b|\bboys?\b|\bfemale\b|\bmale\b|\bunisex\b/i;
+
+export function hasDepartmentWord(query: string): boolean {
+  return DEPARTMENT_WORD.test(query);
+}
+
+export type ShoppingHint = Exclude<ShopFor, "unisex">;
+export type HintSource = "profile" | "fit" | "none";
+
+/**
+ * Decide the department hint for one garment:
+ *   1. the pick OWNER's profile (users.shop_for) when set and not "unisex",
+ *   2. else the garment's vision `fit` when present and not "unisex",
+ *   3. else none.
+ */
+export function shoppingHint(
+  item: Pick<GarmentItem, "fit">,
+  user: { shopFor?: ShopFor | null } | null | undefined,
+): { hint: ShoppingHint | null; source: HintSource } {
+  const profile = user?.shopFor;
+  if (profile === "womens" || profile === "mens") return { hint: profile, source: "profile" };
+  const fit = item.fit;
+  if (fit === "womens" || fit === "mens") return { hint: fit, source: "fit" };
+  return { hint: null, source: "none" };
+}
+
+/**
+ * Final price-search query for a garment: item.searchQuery (or "<color> <description>" when it is
+ * empty) prefixed with "women's " / "men's " per shoppingHint(), unless the query already names a
+ * department (women/men/ladies/girls/boys/...). The result is what lookupOffers() receives, so the
+ * price_cache key (normalizeQuery of this string) automatically differs between hinted and un-hinted
+ * lookups of the same garment.
+ */
+export function buildShoppingQuery(
+  item: Pick<GarmentItem, "searchQuery" | "fit"> & Partial<Pick<GarmentItem, "colorName" | "description">>,
+  user: { shopFor?: ShopFor | null } | null | undefined,
+): string {
+  const base = (item.searchQuery || `${item.colorName ?? ""} ${item.description ?? ""}`).trim().replace(/\s+/g, " ");
+  if (!base) return "";
+  const { hint } = shoppingHint(item, user);
+  if (!hint || hasDepartmentWord(base)) return base;
+  return `${hint === "womens" ? "women's" : "men's"} ${base}`;
+}
+
+/**
+ * Read-time decoration of a pick's items for its owner: sets `shoppingQuery` and rebuilds the
+ * "Compare prices" / "Amazon" search links from it so the chips carry the same hint as the price
+ * lookup. Brand-site links are left as stored (brand search pages already scope by department).
+ * Items with no stored links (very old picks) get a fresh buildLinks() set. Idempotent.
+ */
+export function applyShoppingHints<T extends GarmentItem>(items: T[], owner: { shopFor?: ShopFor | null } | null | undefined): T[] {
+  return items.map((it) => {
+    const shoppingQuery = buildShoppingQuery(it, owner);
+    if (!shoppingQuery) return { ...it, shoppingQuery: it.searchQuery ?? "" };
+    const hinted = buildLinks(shoppingQuery, it.brandGuess ?? null);
+    const byLabel = new Map(hinted.map((l) => [l.label, l.url]));
+    const stored = Array.isArray(it.links) ? it.links : [];
+    const links = stored.length
+      ? stored.map((l) => (l.label === "Compare prices" || l.label === "Amazon") && byLabel.has(l.label) ? { ...l, url: byLabel.get(l.label)! } : l)
+      : hinted;
+    return { ...it, shoppingQuery, links };
+  });
 }
 
 function envInt(name: string, fallback: number): number {

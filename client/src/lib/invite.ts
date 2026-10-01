@@ -111,8 +111,11 @@ export function isStandalone(): boolean {
 }
 
 // ---------- Shop for ----------
-export const SHOP_FOR_VALUES = ["womens", "mens", "unisex"] as const;
-export type ShopFor = (typeof SHOP_FOR_VALUES)[number];
+// Mirrors shared/schema SHOP_FOR; kept as a local const so the client still builds if the shared
+// export is renamed, but typed against the shared ShopFor so they can't drift silently.
+import type { ShopFor } from "@shared/schema";
+export type { ShopFor };
+export const SHOP_FOR_VALUES: readonly ShopFor[] = ["womens", "mens", "unisex"];
 export const SHOP_FOR_OPTIONS: { value: ShopFor; label: string }[] = [
   { value: "womens", label: "Women's" },
   { value: "mens", label: "Men's" },

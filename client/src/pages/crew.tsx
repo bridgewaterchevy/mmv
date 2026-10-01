@@ -1,9 +1,11 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Copy, Check, Users } from "lucide-react";
+import { Copy, Check, Users, Share2 } from "lucide-react";
 import type { CrewView, Session, SessionView } from "@shared/schema";
 import { Page, Avatar } from "@/components/shell";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Button } from "@/components/ui/button";
+import { copyText, shareInvite } from "@/lib/invite";
 import { useToast } from "@/hooks/use-toast";
 import { todayIso } from "@/lib/color";
 import { cn } from "@/lib/utils";
@@ -21,15 +23,30 @@ export default function CrewPage({ params }: { params: { id: string } }) {
 
   const day = useQuery<SessionView>({ queryKey: ["/api/crews", id, "day", date], refetchInterval: 15_000, enabled: !!crew.data });
 
+  const [sharing, setSharing] = useState(false);
+
+  /** Native share sheet (title + text + deep link) or clipboard fallback. */
+  async function invite() {
+    if (!crew.data || sharing) return;
+    setSharing(true);
+    try {
+      const outcome = await shareInvite(crew.data.name, crew.data.inviteCode);
+      if (outcome === "copied") toast({ title: "Invite copied", description: "Paste it into your group chat. The link opens straight to your crew." });
+      else if (outcome === "failed") toast({ title: `Invite code: ${crew.data.inviteCode}`, description: "Couldn't copy automatically — read it out or type it for them." });
+    } finally {
+      setSharing(false);
+    }
+  }
+
+  /** Tap-to-copy just the short code. */
   async function copyCode() {
     if (!crew.data) return;
-    const text = `Join my crew "${crew.data.name}" on MMV (Match My Vibe): open https://mmv.pplx.app, sign up, tap +, "I have a code", and enter ${crew.data.inviteCode}`;
-    try {
-      if (navigator.share) await navigator.share({ text });
-      else await navigator.clipboard.writeText(text);
+    const ok = await copyText(crew.data.inviteCode);
+    if (ok) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch {
+      toast({ title: `Code ${crew.data.inviteCode} copied` });
+    } else {
       toast({ title: `Invite code: ${crew.data.inviteCode}` });
     }
   }
@@ -59,6 +76,10 @@ export default function CrewPage({ params }: { params: { id: string } }) {
         </button>
       }
     >
+      <Button onClick={invite} disabled={sharing} className="mb-4 w-full" size="lg" data-testid="button-invite">
+        <Share2 className="h-4 w-4" /> {sharing ? "Opening share…" : "Invite friends"}
+      </Button>
+
       {showMembers && (
         <section className="mb-4 rounded-2xl border border-card-border bg-card p-4 fade-up">
           <div className="mb-3 flex items-center justify-between">
@@ -74,7 +95,7 @@ export default function CrewPage({ params }: { params: { id: string } }) {
               </div>
             ))}
           </div>
-          <p className="mt-3 text-xs text-muted-foreground">Tap the code to share it. Friends join from the + button on the Crews screen.</p>
+          <p className="mt-3 text-xs text-muted-foreground">Tap the code to copy it, or use Invite friends to send a link that opens straight to this crew.</p>
         </section>
       )}
 

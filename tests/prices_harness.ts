@@ -20,7 +20,12 @@ import {
   resolveDirectLinks,
   dailyBudget,
   directResolvePerItem,
+  buildShoppingQuery,
+  shoppingHint,
+  hasDepartmentWord,
+  applyShoppingHints,
 } from "../server/prices";
+import { normalizeFit } from "../server/vision";
 import { wrapLink, presentOffers, isAmazonUrl } from "../server/affiliate";
 import type { Offer } from "../shared/schema";
 
@@ -193,6 +198,64 @@ async function main() {
     { title: "C", seller: "Walmart", price: 12, priceText: "$12.00", url: "https://www.walmart.com/ip/1", direct: true, retailerHost: "walmart.com", source: "serpapi" },
   ];
   out.present = presentOffers(offers, cfgAll).map((o) => ({ price: o.price, priceText: o.priceText, url: o.url, direct: o.direct, retailerHost: o.retailerHost, hasToken: "immersiveToken" in o }));
+
+  // ---- buildShoppingQuery: women's/men's hint from the pick owner's profile, else the garment's vision fit
+  const crew = { searchQuery: "royal blue athletic crewneck long sleeve", fit: "unisex" as const };
+  const bra = { searchQuery: "black longline sports bra", fit: "womens" as const };
+  const tee = { searchQuery: "grey boxy cotton tee", fit: "mens" as const };
+  const legacy = { searchQuery: "black high rise leggings" } as { searchQuery: string; fit?: "womens" | "mens" | "unisex" }; // stored before `fit` existed
+  out.shopping = {
+    profileWomens: buildShoppingQuery(crew, { shopFor: "womens" }),
+    profileMens: buildShoppingQuery(crew, { shopFor: "mens" }),
+    profileOverridesFit: buildShoppingQuery(bra, { shopFor: "mens" }),
+    profileUnisexFallsToFit: buildShoppingQuery(bra, { shopFor: "unisex" }),
+    profileNullFallsToFit: buildShoppingQuery(tee, { shopFor: null }),
+    noUserFallsToFit: buildShoppingQuery(bra, null),
+    unisexBoth: buildShoppingQuery(crew, { shopFor: "unisex" }),
+    nullAndLegacy: buildShoppingQuery(legacy, { shopFor: null }),
+    legacyWithProfile: buildShoppingQuery(legacy, { shopFor: "womens" }),
+    alreadyWomens: buildShoppingQuery({ searchQuery: "Women's Align leggings black", fit: "womens" }, { shopFor: "womens" }),
+    alreadyWomenNoApostrophe: buildShoppingQuery({ searchQuery: "white running shoes women", fit: "unisex" }, { shopFor: "mens" }),
+    alreadyMens: buildShoppingQuery({ searchQuery: "mens nike dri-fit tee", fit: "unisex" }, { shopFor: "womens" }),
+    alreadyLadies: buildShoppingQuery({ searchQuery: "ladies golf skort navy", fit: "unisex" }, { shopFor: "mens" }),
+    alreadyGirls: buildShoppingQuery({ searchQuery: "girls pink leotard", fit: "unisex" }, { shopFor: "womens" }),
+    alreadyUnisexWord: buildShoppingQuery({ searchQuery: "unisex black hoodie", fit: "unisex" }, { shopFor: "womens" }),
+    garmentNotMen: buildShoppingQuery({ searchQuery: "garment dyed crewneck", fit: "unisex" }, { shopFor: "mens" }), // "men" inside "garment" must not count
+    whitespaceCollapsed: buildShoppingQuery({ searchQuery: "  royal   blue  crewneck ", fit: "unisex" }, { shopFor: "womens" }),
+    emptyFallsToColorDesc: buildShoppingQuery({ searchQuery: "", colorName: "black", description: "leggings", fit: "womens" }, null),
+    empty: buildShoppingQuery({ searchQuery: "", fit: "womens" }, { shopFor: "womens" }),
+    hintSources: [shoppingHint(bra, { shopFor: "mens" }).source, shoppingHint(bra, { shopFor: "unisex" }).source, shoppingHint(crew, null).source],
+    departmentWords: ["women", "Women's", "womens", "men", "men's", "mens", "ladies", "girls", "boys", "female", "male", "unisex", "garment", "woman", "man"].map((w) => hasDepartmentWord(`black ${w} tee`)),
+    cacheKeysDiffer: normalizeQuery(buildShoppingQuery(crew, { shopFor: "womens" })) !== normalizeQuery(buildShoppingQuery(crew, { shopFor: "mens" })) && normalizeQuery(buildShoppingQuery(crew, { shopFor: "mens" })) !== normalizeQuery(crew.searchQuery),
+    normalizeFit: [normalizeFit("womens"), normalizeFit("Women's"), normalizeFit("men"), normalizeFit("unisex"), normalizeFit("kids"), normalizeFit(undefined), normalizeFit(null)],
+  };
+  // applyShoppingHints: Compare prices / Amazon links rebuilt from the hinted query, brand link kept, shoppingQuery set
+  const storedItem = {
+    category: "leggings", description: "black leggings", colorName: "black", colorHex: "#000000", brandGuess: "lululemon",
+    searchQuery: "lululemon align legging black", fit: "womens" as const,
+    links: [
+      { label: "Compare prices", url: "https://www.google.com/search?tbm=shop&q=lululemon%20align%20legging%20black" },
+      { label: "Amazon", url: "https://www.amazon.com/s?k=lululemon%20align%20legging%20black" },
+      { label: "lululemon site", url: "https://shop.lululemon.com/search?Ntt=align%20legging%20black" },
+    ],
+  };
+  const noLinks = { ...storedItem, links: [] as { label: string; url: string }[] };
+  const [hintedMens] = applyShoppingHints([storedItem], { shopFor: "mens" });
+  const [hintedFit] = applyShoppingHints([storedItem], { shopFor: null });
+  const [hintedNone] = applyShoppingHints([{ ...storedItem, fit: "unisex" as const }], { shopFor: null });
+  const [hintedNoLinks] = applyShoppingHints([noLinks], { shopFor: "womens" });
+  const [twice] = applyShoppingHints(applyShoppingHints([storedItem], { shopFor: "mens" }), { shopFor: "mens" });
+  out.applyHints = {
+    mensQuery: hintedMens.shoppingQuery,
+    mensLinks: hintedMens.links.map((l) => [l.label, l.url]),
+    fitQuery: hintedFit.shoppingQuery,
+    fitCompare: hintedFit.links.find((l) => l.label === "Compare prices")?.url,
+    noneQuery: hintedNone.shoppingQuery,
+    noneLinksUnchanged: JSON.stringify(hintedNone.links) === JSON.stringify(storedItem.links),
+    noLinksRebuilt: hintedNoLinks.links.map((l) => l.label),
+    storedUntouched: storedItem.links[0].url,
+    idempotent: JSON.stringify(twice) === JSON.stringify(hintedMens),
+  };
 
   console.log(JSON.stringify(out));
 }

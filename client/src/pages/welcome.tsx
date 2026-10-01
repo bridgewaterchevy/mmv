@@ -1,10 +1,13 @@
 import { useState } from "react";
+import { Ticket } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Logo, APP_NAME } from "@/components/shell";
 import { useAuth } from "@/lib/auth";
 import { useToast } from "@/hooks/use-toast";
+import { getPendingInvite, type ShopFor } from "@/lib/invite";
+import { InstallHint, ShopForControl } from "@/components/preferences";
 
 export default function Welcome() {
   const { signup, login } = useAuth();
@@ -13,14 +16,16 @@ export default function Welcome() {
   const [name, setName] = useState("");
   const [handle, setHandle] = useState("");
   const [pin, setPin] = useState("");
+  const [shopFor, setShopFor] = useState<ShopFor | null>(null);
   const [busy, setBusy] = useState(false);
+  const pendingInvite = getPendingInvite();
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true);
     dismiss();
     try {
-      if (mode === "signup") await signup({ name, handle, pin });
+      if (mode === "signup") await signup({ name, handle, pin, ...(shopFor ? { shopFor } : {}) });
       else await login({ handle, pin });
     } catch (err) {
       toast({ title: (err as Error).message, variant: "destructive" });
@@ -32,6 +37,19 @@ export default function Welcome() {
   return (
     <div className="mx-auto flex min-h-[100dvh] w-full max-w-md flex-col bg-background px-6 pb-10 pt-[calc(env(safe-area-inset-top,0px)+2.5rem)]">
       <Logo className="mb-10" />
+      {pendingInvite && (
+        <div className="mb-6 flex items-center gap-3 rounded-2xl border border-primary/30 bg-primary/10 p-3.5 fade-up" role="status" data-testid="banner-invite">
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground">
+            <Ticket className="h-5 w-5" />
+          </span>
+          <div className="min-w-0">
+            <p className="text-sm font-semibold leading-tight">You're invited to a crew — sign up to join</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              Code <span className="font-mono font-semibold tracking-widest text-foreground">{pendingInvite}</span> is saved. Already have an account? Sign in instead.
+            </p>
+          </div>
+        </div>
+      )}
       <div className="mb-8 fade-up">
         <p className="mb-2 text-sm font-medium uppercase tracking-wider text-primary">Date night · girls' night · game day · gym</p>
         <h1 className="font-display text-xl font-bold leading-snug">
@@ -105,10 +123,20 @@ export default function Welcome() {
           />
           <p className="text-xs text-muted-foreground">Quick sign-in for the early test. Real accounts come later.</p>
         </div>
+        {mode === "signup" && (
+          <div className="space-y-1.5">
+            <div className="flex items-baseline justify-between">
+              <Label>Shop for</Label>
+              <span className="text-xs text-muted-foreground">Optional</span>
+            </div>
+            <ShopForControl value={shopFor} onChange={setShopFor} idPrefix="signup-shopfor" />
+          </div>
+        )}
         <Button type="submit" className="w-full" size="lg" disabled={busy} data-testid="button-submit-auth">
-          {busy ? "One sec…" : mode === "signup" ? `Join ${APP_NAME}` : "Sign in"}
+          {busy ? "One sec…" : mode === "signup" ? (pendingInvite ? "Sign up & join crew" : `Join ${APP_NAME}`) : pendingInvite ? "Sign in & join crew" : "Sign in"}
         </Button>
       </form>
+      <InstallHint className="mt-4" />
     </div>
   );
 }

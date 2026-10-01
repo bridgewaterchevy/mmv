@@ -13,10 +13,14 @@ Part 1 runs tests/prices_harness.ts (one Node process, throwaway pglite dir) and
   direct retailer links: `link` preferred over product_link, Google ad-redirect (adurl=) unwrapping,
   direct/retailerHost fields, Immersive Product fallback (MOCK_IMMERSIVE_JSON) resolving only the
   cheapest non-direct offer, budget accounting (1 unit per resolve), resolved url cached in the same row
-  (fresh-process read = zero provider calls), store choice by seller name / cheapest.
+  (fresh-process read = zero provider calls), store choice by seller name / cheapest,
+  buildShoppingQuery (women's/men's hint: profile shopFor overrides vision fit, unisex/null fall back to
+  fit, existing women/men/ladies/girls words never doubled, no hint -> unchanged, cache keys differ),
+  applyShoppingHints (Compare prices / Amazon links rebuilt from the hinted query, brand link kept).
 Part 2 boots the real server on a spare port with the mocks + SOVRN_API_KEY/AMAZON_ASSOCIATES_TAG,
   creates a crew/day/pick and checks GET /api/picks/:id/prices end to end (200 shape, offers,
-  wrapped links in both offers and item.links, Amazon masking, 403 for non-members, 401 unauth).
+  wrapped links in both offers and item.links, Amazon masking, 403 for non-members, 401 unauth),
+  plus signup { shopFor } / PATCH /api/me { shopFor } and the hinted shoppingQuery on pick items.
 Exit code 0 only if everything passes.
 """
 import json
@@ -89,9 +93,10 @@ MOCK_VISION = {
     "palette": ["#1C1E24", "#F0F0F0"],
     "items": [
         {"category": "leggings", "description": "black high-rise leggings", "colorName": "black", "colorHex": "#1C1E24",
-         "brandGuess": "lululemon", "searchQuery": "lululemon align high rise legging black"},
+         "brandGuess": "lululemon", "searchQuery": "lululemon align high rise legging black", "fit": "womens"},
+        # query already says "women" -> never prefixed, whatever the profile says
         {"category": "shoes", "description": "white running shoes", "colorName": "white", "colorHex": "#F0F0F0",
-         "brandGuess": None, "searchQuery": "white running shoes women"},
+         "brandGuess": None, "searchQuery": "white running shoes women"},  # no fit -> treated as unisex
     ],
 }
 
@@ -214,6 +219,43 @@ def run_harness():
     check("presentOffers: google link -> direct:false, retailerHost ''", gl and gl["direct"] is False and gl["retailerHost"] == "", gl)
     check("presentOffers: immersiveToken never sent to the client", all(o["hasToken"] is False for o in pr), pr)
 
+    sq = r["shopping"]
+    check("buildShoppingQuery: profile womens -> \"women's \" prefix", sq["profileWomens"] == "women's royal blue athletic crewneck long sleeve", sq["profileWomens"])
+    check("buildShoppingQuery: profile mens -> \"men's \" prefix", sq["profileMens"] == "men's royal blue athletic crewneck long sleeve", sq["profileMens"])
+    check("buildShoppingQuery: profile overrides vision fit (mens profile, womens bra)", sq["profileOverridesFit"] == "men's black longline sports bra", sq["profileOverridesFit"])
+    check("buildShoppingQuery: profile unisex falls back to fit", sq["profileUnisexFallsToFit"] == "women's black longline sports bra", sq["profileUnisexFallsToFit"])
+    check("buildShoppingQuery: profile null falls back to fit (mens tee)", sq["profileNullFallsToFit"] == "men's grey boxy cotton tee", sq["profileNullFallsToFit"])
+    check("buildShoppingQuery: no user object falls back to fit", sq["noUserFallsToFit"] == "women's black longline sports bra", sq["noUserFallsToFit"])
+    check("buildShoppingQuery: unisex profile + unisex fit -> unchanged", sq["unisexBoth"] == "royal blue athletic crewneck long sleeve", sq["unisexBoth"])
+    check("buildShoppingQuery: null profile + legacy item without fit -> unchanged", sq["nullAndLegacy"] == "black high rise leggings", sq["nullAndLegacy"])
+    check("buildShoppingQuery: legacy item without fit still gets the profile hint", sq["legacyWithProfile"] == "women's black high rise leggings", sq["legacyWithProfile"])
+    check("buildShoppingQuery: existing \"Women's\" not doubled", sq["alreadyWomens"] == "Women's Align leggings black", sq["alreadyWomens"])
+    check("buildShoppingQuery: existing \"women\" (no apostrophe) blocks a men's prefix", sq["alreadyWomenNoApostrophe"] == "white running shoes women", sq["alreadyWomenNoApostrophe"])
+    check("buildShoppingQuery: existing \"mens\" blocks a women's prefix", sq["alreadyMens"] == "mens nike dri-fit tee", sq["alreadyMens"])
+    check("buildShoppingQuery: existing \"ladies\" / \"girls\" / \"unisex\" block the prefix",
+          sq["alreadyLadies"] == "ladies golf skort navy" and sq["alreadyGirls"] == "girls pink leotard" and sq["alreadyUnisexWord"] == "unisex black hoodie",
+          [sq["alreadyLadies"], sq["alreadyGirls"], sq["alreadyUnisexWord"]])
+    check("buildShoppingQuery: 'men' inside 'garment' is not a department word", sq["garmentNotMen"] == "men's garment dyed crewneck", sq["garmentNotMen"])
+    check("buildShoppingQuery: whitespace collapsed before prefixing", sq["whitespaceCollapsed"] == "women's royal blue crewneck", sq["whitespaceCollapsed"])
+    check("buildShoppingQuery: empty searchQuery -> color + description, still hinted", sq["emptyFallsToColorDesc"] == "women's black leggings", sq["emptyFallsToColorDesc"])
+    check("buildShoppingQuery: nothing to search -> ''", sq["empty"] == "", sq["empty"])
+    check("shoppingHint: source profile / fit / none", sq["hintSources"] == ["profile", "fit", "none"], sq["hintSources"])
+    check("hasDepartmentWord: women/women's/womens/men/men's/mens/ladies/girls/boys/female/male/unisex/woman/man yes, garment no",
+          sq["departmentWords"] == [True] * 12 + [False, True, True], sq["departmentWords"])
+    check("buildShoppingQuery: hinted queries normalise to distinct price_cache keys", sq["cacheKeysDiffer"] is True, sq["cacheKeysDiffer"])
+    check("normalizeFit: womens/Women's/men/unisex/kids/undefined/null", sq["normalizeFit"] == ["womens", "womens", "mens", "unisex", "unisex", "unisex", "unisex"], sq["normalizeFit"])
+
+    ah = r["applyHints"]
+    check("applyShoppingHints: shoppingQuery set from profile", ah["mensQuery"] == "men's lululemon align legging black", ah["mensQuery"])
+    links = dict(ah["mensLinks"])
+    check("applyShoppingHints: Compare prices link rebuilt from hinted query", links.get("Compare prices") == "https://www.google.com/search?tbm=shop&q=men's%20lululemon%20align%20legging%20black", links)
+    check("applyShoppingHints: Amazon link rebuilt from hinted query", links.get("Amazon") == "https://www.amazon.com/s?k=men's%20lululemon%20align%20legging%20black", links)
+    check("applyShoppingHints: brand-site link kept as stored", links.get("lululemon site") == "https://shop.lululemon.com/search?Ntt=align%20legging%20black", links)
+    check("applyShoppingHints: null profile -> fit hint (women's) in query + links", ah["fitQuery"] == "women's lululemon align legging black" and "women's%20" in (ah["fitCompare"] or ""), ah)
+    check("applyShoppingHints: no hint -> shoppingQuery == searchQuery, links untouched", ah["noneQuery"] == "lululemon align legging black" and ah["noneLinksUnchanged"] is True, ah)
+    check("applyShoppingHints: item without stored links gets a fresh set", ah["noLinksRebuilt"] == ["Compare prices", "Amazon", "lululemon site"], ah["noLinksRebuilt"])
+    check("applyShoppingHints: pure (input not mutated) and idempotent", ah["storedUntouched"].endswith("q=lululemon%20align%20legging%20black") and ah["idempotent"] is True, ah)
+
 
 # --------------------------------------------------------------------------- part 2: server
 def run_server_test():
@@ -228,7 +270,7 @@ def run_server_test():
     tmp = tempfile.mkdtemp(prefix="mmv-prices-srv-")
     env = {**os.environ, "PORT": str(port), "NODE_ENV": "development", "PGLITE_DIR": os.path.join(tmp, "pglite"),
            "MOCK_PRICES_JSON": json.dumps(MOCK_SERPAPI), "MOCK_IMMERSIVE_JSON": json.dumps(MOCK_IMMERSIVE), "MOCK_VISION_JSON": json.dumps(MOCK_VISION),
-           "SOVRN_API_KEY": "sovrn-test", "AMAZON_ASSOCIATES_TAG": "mmvtest-20", "PRICE_LOOKUPS_PER_DAY": "8"}
+           "SOVRN_API_KEY": "sovrn-test", "AMAZON_ASSOCIATES_TAG": "mmvtest-20", "PRICE_LOOKUPS_PER_DAY": "20"}
     env.pop("PRICE_DIRECT_RESOLVE_PER_ITEM", None)
     for k in ("SERPAPI_KEY", "HASDATA_API_KEY", "DATABASE_URL", "SUPABASE_DB_PASSWORD", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "GEMINI_API_KEY"):
         env.pop(k, None)
@@ -262,9 +304,24 @@ def run_server_test():
             return requests.request(method, base + path, headers=headers, timeout=30, **kw)
 
         rnd = lambda p: p + "".join(random.choices(string.ascii_lowercase, k=8))  # noqa: E731
-        tok_a = api("POST", "/api/auth/signup", json={"name": "A", "handle": rnd("pa_"), "pin": "1234"}).json()["token"]
-        tok_b = api("POST", "/api/auth/signup", json={"name": "B", "handle": rnd("pb_"), "pin": "1234"}).json()["token"]
+        # ---- signup accepts optional shopFor; PATCH /api/me updates it
+        sa = api("POST", "/api/auth/signup", json={"name": "A", "handle": rnd("pa_"), "pin": "1234", "shopFor": "womens"})
+        check("signup: { shopFor: 'womens' } accepted and echoed as user.shopFor", sa.status_code == 200 and sa.json()["user"].get("shopFor") == "womens", f"{sa.status_code} {sa.text[:200]}")
+        tok_a = sa.json()["token"]
+        sb = api("POST", "/api/auth/signup", json={"name": "B", "handle": rnd("pb_"), "pin": "1234"})
+        check("signup: shopFor omitted -> user.shopFor null", sb.status_code == 200 and "shopFor" in sb.json()["user"] and sb.json()["user"]["shopFor"] is None, f"{sb.status_code} {sb.text[:200]}")
+        tok_b = sb.json()["token"]
         tok_c = api("POST", "/api/auth/signup", json={"name": "C", "handle": rnd("pc_"), "pin": "1234"}).json()["token"]
+        bad = api("POST", "/api/auth/signup", json={"name": "D", "handle": rnd("pd_"), "pin": "1234", "shopFor": "kids"})
+        check("signup: invalid shopFor -> 400", bad.status_code == 400, f"{bad.status_code} {bad.text[:200]}")
+        pm = api("PATCH", "/api/me", tok_a, json={"shopFor": "mens"})
+        check("PATCH /api/me { shopFor: 'mens' } -> 200 PublicUser with shopFor=mens, no pin/token",
+              pm.status_code == 200 and pm.json().get("shopFor") == "mens" and "pin" not in pm.json() and "token" not in pm.json(), f"{pm.status_code} {pm.text[:200]}")
+        me = api("GET", "/api/me", tok_a)
+        check("GET /api/me reflects shopFor=mens", me.status_code == 200 and me.json().get("shopFor") == "mens", me.text[:200])
+        check("PATCH /api/me invalid value -> 400", api("PATCH", "/api/me", tok_a, json={"shopFor": "kids"}).status_code == 400)
+        check("PATCH /api/me missing key -> 400", api("PATCH", "/api/me", tok_a, json={}).status_code == 400)
+        check("PATCH /api/me no token -> 401", api("PATCH", "/api/me", json={"shopFor": "mens"}).status_code == 401)
         crew = api("POST", "/api/crews", tok_a, json={"name": "Prices", "activity": "Gym"}).json()
         api("POST", "/api/crews/join", tok_b, json={"inviteCode": crew["inviteCode"]})
         sess = api("GET", f"/api/crews/{crew['id']}/day/2030-01-01", tok_a).json()
@@ -280,6 +337,16 @@ def run_server_test():
         check("pick view: Amazon link carries ?tag=", bool(amazon) and "tag=mmvtest-20" in amazon[0]["url"], links)
         check("pick view: brand-site link Sovrn-wrapped", bool(brand) and brand[0]["url"].startswith("https://redirect.viglink.com?key=sovrn-test&u="), links)
         check("pick view: google compare link untouched", bool(compare) and compare[0]["url"].startswith("https://www.google.com/"), links)
+        # owner A has shopFor=mens -> profile overrides the leggings' vision fit (womens)
+        check("pick view: items carry fit from vision (womens) / unisex default when missing",
+              pick["items"][0].get("fit") == "womens" and pick["items"][1].get("fit") == "unisex", [i.get("fit") for i in pick["items"]])
+        check("pick view: shoppingQuery = men's + searchQuery (owner profile beats fit)",
+              pick["items"][0].get("shoppingQuery") == "men's lululemon align high rise legging black", pick["items"][0].get("shoppingQuery"))
+        check("pick view: searchQuery itself unchanged (stored value)", pick["items"][0]["searchQuery"] == "lululemon align high rise legging black", pick["items"][0]["searchQuery"])
+        check("pick view: query already containing 'women' is not prefixed", pick["items"][1].get("shoppingQuery") == "white running shoes women", pick["items"][1].get("shoppingQuery"))
+        check("pick view: Compare prices + Amazon chips use the hinted query",
+              bool(compare) and "men's%20lululemon" in compare[0]["url"] and bool(amazon)
+              and urllib.parse.parse_qs(urllib.parse.urlparse(amazon[0]["url"]).query).get("k", [""])[0] == "men's lululemon align high rise legging black", [compare, amazon])
 
         r = api("GET", f"/api/picks/{pick['id']}/prices", tok_b)
         body = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
@@ -287,6 +354,7 @@ def run_server_test():
             return
         items = body["items"]
         check("prices: one entry per item, carries category/searchQuery/links/offers", len(items) == 2 and all(k in items[0] for k in ("category", "searchQuery", "links", "offers")), [list(i.keys()) for i in items])
+        check("prices: items carry shoppingQuery (hinted) used for the lookup", items[0].get("shoppingQuery") == "men's lululemon align high rise legging black" and items[1].get("shoppingQuery") == "white running shoes women", [i.get("shoppingQuery") for i in items])
         offers = items[0]["offers"]
         priced = [o["price"] for o in offers if o["price"] is not None]
         check("prices: 6 offers, priced ascending then unpriced (masked Amazon) last",
@@ -314,6 +382,17 @@ def run_server_test():
         check("prices: non-member -> 403", api("GET", f"/api/picks/{pick['id']}/prices", tok_c).status_code == 403)
         check("prices: no token -> 401", api("GET", f"/api/picks/{pick['id']}/prices").status_code == 401)
         check("prices: unknown pick -> 404", api("GET", "/api/picks/999999/prices", tok_a).status_code == 404)
+
+        # ---- owner clears shopFor -> hint falls back to the garment's vision fit (womens), stored pick untouched
+        pc = api("PATCH", "/api/me", tok_a, json={"shopFor": None})
+        check("PATCH /api/me { shopFor: null } -> 200, shopFor null", pc.status_code == 200 and pc.json().get("shopFor") is None, pc.text[:200])
+        sv = api("GET", f"/api/sessions/{sess['id']}", tok_b).json()
+        mine = [p for p in sv["picks"] if p["id"] == pick["id"]]
+        check("pick view after clearing profile: shoppingQuery = women's + searchQuery (vision fit)",
+              bool(mine) and mine[0]["items"][0].get("shoppingQuery") == "women's lululemon align high rise legging black", mine and mine[0]["items"][0].get("shoppingQuery"))
+        r3 = api("GET", f"/api/picks/{pick['id']}/prices", tok_b)
+        check("prices after clearing profile: lookup uses the women's query (fresh cache key, still 200 with offers)",
+              r3.status_code == 200 and r3.json()["items"][0]["shoppingQuery"] == "women's lululemon align high rise legging black" and len(r3.json()["items"][0]["offers"]) == 6, r3.text[:200])
         check("cleanup: DELETE pick -> 200", api("DELETE", f"/api/picks/{pick['id']}", tok_a).status_code == 200)
     finally:
         proc.terminate()
