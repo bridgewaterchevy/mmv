@@ -1,0 +1,36 @@
+# Render Blueprint for MMV (Match My Vibe)
+# Spec: https://render.com/docs/blueprint-spec
+#
+# One free Node web service. Postgres + file storage live on Supabase (not Render),
+# so there is no `databases:` section here. Secrets are declared with `sync: false`,
+# which makes the Render dashboard prompt for their values when the Blueprint is first
+# deployed (they are never stored in this file).
+services:
+  - type: web
+    name: mmv
+    runtime: node
+    plan: free              # 0.1 CPU / 512 MB; spins down after 15 idle minutes
+    region: oregon          # or: ohio
+    # --include=dev is required: NODE_ENV=production (below) is also set at build time, and
+    # npm then skips devDependencies (vite/esbuild/tsx live there). See
+    # https://docs.npmjs.com/cli/v10/commands/npm-ci (omit/include) and
+    # https://community.render.com/t/nextjs-13-build-failing-error-cannot-find-module-tailwindcss/14503
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit   # redeploy on every push to the linked branch
+    envVars:
+      - key: NODE_VERSION
+        value: "20"          # Node major used for development; Render resolves to latest 20.x
+      - key: NODE_ENV
+        value: production
+      - key: SUPABASE_BUCKET
+        value: outfits
+      - key: DATABASE_URL
+        sync: false          # Supabase "Transaction pooler" URI (port 6543) with the DB password filled in
+      - key: SUPABASE_URL
+        sync: false          # https://<project-ref>.supabase.co
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false          # Supabase secret key (sb_secret_...) or legacy service_role JWT. SECRET.
+      - key: GEMINI_API_KEY
+        sync: false          # Google AI Studio key. SECRET.

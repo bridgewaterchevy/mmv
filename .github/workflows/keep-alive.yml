@@ -1,0 +1,42 @@
+# Keeps the free Render web service awake and keeps the free Supabase project active.
+#
+# - Render free web services spin down after 15 minutes without inbound traffic and take
+#   about a minute to wake up: https://render.com/docs/free
+# - Supabase free projects are paused after 7 days without enough database activity:
+#   https://supabase.com/docs/guides/platform/free-project-pausing
+# - GitHub schedules: shortest interval is 5 minutes, runs can be delayed (or dropped) under
+#   load, and on PUBLIC repos schedules are auto-disabled after 60 days without repo activity:
+#   https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule
+# - Cost: Actions minutes are free on public repos. Private repos get 2,000 min/month and each
+#   run is billed as at least 1 minute, so a 10-minute schedule (~4,300 runs/month) would exceed
+#   the free quota on a PRIVATE repo: https://docs.github.com/en/billing/managing-billing-for-your-products/about-billing-for-github-actions
+#
+# Required: repository variable APP_URL = your Render hostname WITHOUT https://,
+# e.g. mmv.onrender.com  (Settings -> Secrets and variables -> Actions -> Variables).
+
+name: keep-alive
+
+on:
+  schedule:
+    - cron: "3,13,23,33,43,53 * * * *"   # every 10 min, off the top of the hour to avoid GitHub's busiest moment
+    - cron: "17 9 * * 1"                 # weekly (Mon 09:17 UTC) Supabase activity ping
+  workflow_dispatch: {}                  # lets you run it by hand from the Actions tab
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping /api/health (wakes Render; touches Supabase if the health route queries the DB)
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          if [ -z "$APP_URL" ]; then
+            echo "Repository variable APP_URL is not set." >&2
+            exit 1
+          fi
+          curl -fsS --max-time 30 "https://${APP_URL}/api/health"
+          echo
+          echo "ok (${{ github.event.schedule || 'manual' }})"
