@@ -55,3 +55,10 @@ services:
         sync: false          # Sovrn Commerce API key; wraps retailer links for commission. SECRET.
       - key: AMAZON_ASSOCIATES_TAG
         sync: false          # Amazon Associates tracking id (e.g. yourstore-20). Not secret, but account-specific.
+      # "Report a problem" -> GitHub issue (optional; reports are always saved in the database)
+      - key: GITHUB_ISSUES_TOKEN
+        sync: false          # Fine-grained PAT, Issues: Read and write on GITHUB_ISSUES_REPO only. SECRET. Blank = no issues filed.
+      - key: GITHUB_ISSUES_REPO
+        value: bridgewaterchevy/mmv   # owner/repo that receives "[Report] ..." issues (label user-report)
+      - key: ADMIN_HANDLES
+        sync: false          # Comma-separated app handles allowed to read/resolve reports (GET/PATCH /api/feedback). Not secret, but account-specific.

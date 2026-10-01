@@ -5,6 +5,7 @@ import {
   sessions,
   picks,
   reactions,
+  feedback,
 } from "@shared/schema";
 import type {
   User,
@@ -19,6 +20,9 @@ import type {
   ReactionView,
   GarmentItem,
   ShopFor,
+  Feedback,
+  FeedbackReport,
+  FeedbackStatus,
 } from "@shared/schema";
 import { and, eq, inArray, desc, asc, count, gte } from "drizzle-orm";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
@@ -326,6 +330,66 @@ export class DatabaseStorage {
       .values({ pickId: data.pickId, userId: data.userId, emoji: data.emoji ?? null, comment: data.comment ?? null })
       .returning();
     return row;
+  }
+
+  // ----- feedback ("Report a problem") -----
+  async createFeedback(data: {
+    userId: number;
+    message: string;
+    page?: string | null;
+    userAgent?: string | null;
+    appVersion?: string | null;
+    lastError?: string | null;
+  }): Promise<Feedback> {
+    const db = await getDb();
+    const [row] = await db
+      .insert(feedback)
+      .values({
+        userId: data.userId,
+        message: data.message,
+        page: data.page ?? null,
+        userAgent: data.userAgent ?? null,
+        appVersion: data.appVersion ?? null,
+        lastError: data.lastError ?? null,
+        status: "open",
+        createdAt: new Date(),
+      })
+      .returning();
+    return row;
+  }
+  async updateFeedback(id: number, data: { screenshotPath?: string | null; githubIssueUrl?: string | null; status?: FeedbackStatus }): Promise<Feedback> {
+    const db = await getDb();
+    const set: Partial<typeof feedback.$inferInsert> = {};
+    if (data.screenshotPath !== undefined) set.screenshotPath = data.screenshotPath;
+    if (data.githubIssueUrl !== undefined) set.githubIssueUrl = data.githubIssueUrl;
+    if (data.status !== undefined) set.status = data.status;
+    if (Object.keys(set).length === 0) return (await this.getFeedback(id))!;
+    const [row] = await db.update(feedback).set(set).where(eq(feedback.id, id)).returning();
+    return row;
+  }
+  async getFeedback(id: number): Promise<Feedback | undefined> {
+    if (!Number.isInteger(id)) return undefined;
+    const db = await getDb();
+    const [row] = await db.select().from(feedback).where(eq(feedback.id, id)).limit(1);
+    return row;
+  }
+  async countFeedbackSince(userId: number, since: Date): Promise<number> {
+    const db = await getDb();
+    const [{ value }] = await db
+      .select({ value: count() })
+      .from(feedback)
+      .where(and(eq(feedback.userId, userId), gte(feedback.createdAt, since)));
+    return Number(value);
+  }
+  /** Newest first, capped. Reporter name/handle attached for the admin list. */
+  async listFeedback(limit = 100): Promise<FeedbackReport[]> {
+    const db = await getDb();
+    const rows = await db.select().from(feedback).orderBy(desc(feedback.createdAt), desc(feedback.id)).limit(limit);
+    if (rows.length === 0) return [];
+    const ids = Array.from(new Set(rows.map((r) => r.userId)));
+    const people = await db.select({ id: users.id, name: users.name, handle: users.handle }).from(users).where(inArray(users.id, ids));
+    const byId = new Map(people.map((u) => [u.id, u]));
+    return rows.map((r) => ({ ...r, user: byId.get(r.userId) ?? null }));
   }
 }
 

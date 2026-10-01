@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import type { PublicUser } from "@shared/schema";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/lib/auth";
+import { openReportProblem } from "@/components/report-problem";
 
 export const APP_NAME = "MMV";
 export const APP_TAGLINE = "Match My Vibe";
@@ -122,6 +123,16 @@ function TabBar() {
         >
           <LogOut className="h-5 w-5" strokeWidth={1.8} />
           Sign out
+        </button>
+      </div>
+      <div className="-mt-1 flex justify-center pb-1">
+        <button
+          type="button"
+          onClick={openReportProblem}
+          className="rounded-md px-2 py-0.5 text-[11px] text-muted-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          data-testid="link-report-problem"
+        >
+          Report a problem
         </button>
       </div>
     </nav>

@@ -15,7 +15,9 @@ What it does (end to end, with two throwaway users):
   -> upload synthetic JPEG as A (checks items/palette/analysisFailed, fetches photoPath)
   -> upload as B -> .txt upload rejected 400 -> lazy prices for A's pick (200 {items}; offers may be
      empty without SERPAPI_KEY/HASDATA_API_KEY) -> lock/unlock pick -> emoji + comment reactions
-  -> closet -> wrong PIN 401 -> repeated wrong PINs 429 -> no-token 401 -> delete picks (cleanup).
+  -> closet -> report a problem (POST /api/feedback 200 {id, githubIssueUrl}, missing message 400,
+     admin endpoints 403 for a normal user) -> wrong PIN 401 -> repeated wrong PINs 429 -> no-token 401
+  -> delete picks (cleanup).
 
 Exit code 0 only if every check passes. Prints a PASS/FAIL table.
 
@@ -24,6 +26,8 @@ Notes:
     in an hour from one machine will fail at the signup step with 429.
   * The wrong-PIN test burns the 6-attempt/15-min login budget for the throwaway
     user B only; it never touches real accounts.
+  * The feedback step files ONE real GitHub issue per run when the server has GITHUB_ISSUES_TOKEN
+    configured (title "[Report] [smoke] …", label user-report). Close it or pass --no-feedback.
 """
 import argparse
 import io
@@ -46,6 +50,7 @@ UPLOAD_TIMEOUT = 120  # vision analysis can take a while on free tiers
 
 RESULTS = []  # (name, ok, detail)
 VERBOSE = False
+FEEDBACK = True  # --no-feedback skips the "report a problem" step (avoids filing a GitHub issue)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -391,6 +396,35 @@ def run(base):
             check("closet is a list containing our pick", isinstance(closet, list) and any(p.get("id") == pid_a for p in closet),
                   f"{len(closet) if isinstance(closet, list) else closet}")
 
+        # ---- report a problem (feedback). Throwaway users are never in ADMIN_HANDLES -> admin routes 403.
+        if FEEDBACK:
+            r = api("POST", "/api/feedback", tok_a, json={
+                "message": "[smoke] automated test report - safe to close",
+                "page": "/smoke", "userAgent": "mmv-smoke/1.0", "appVersion": "smoke", "lastError": "none (smoke test)",
+            }, timeout=60)
+            fb = expect("POST /api/feedback (JSON, no screenshot) -> 200 {id, githubIssueUrl}", r, 200, ["id", "githubIssueUrl"])
+            if fb:
+                check("feedback id is an integer", isinstance(fb["id"], int), repr(fb["id"]))
+                gh = fb["githubIssueUrl"]
+                record("feedback githubIssueUrl is null or a github.com issue link", gh is None or (isinstance(gh, str) and gh.startswith("https://github.com/")),
+                       "no GitHub filing configured (GITHUB_ISSUES_TOKEN unset) - report saved only" if gh is None else gh)
+                print(f"  >> FEEDBACK: saved #{fb['id']}" + (f", issue {gh}" if gh else " (no GitHub issue: token not configured or filing failed - see server logs '[github]')"))
+            r = api("POST", "/api/feedback", tok_a, json={"page": "/smoke"})
+            expect("POST /api/feedback without message -> 400", r, 400)
+            r = api("POST", "/api/feedback", tok_a, json={"message": "x" * 2001})
+            expect("POST /api/feedback message > 2000 chars -> 400", r, 400)
+            r = api("POST", "/api/feedback", json={"message": "no token"})
+            expect("POST /api/feedback without token -> 401", r, 401)
+            r = api("GET", "/api/feedback", tok_a)
+            expect("GET /api/feedback as non-admin -> 403", r, 403)
+            if fb:
+                r = api("PATCH", f"/api/feedback/{fb['id']}", tok_a, json={"status": "resolved"})
+                expect("PATCH /api/feedback/:id as non-admin -> 403", r, 403)
+            r = api("GET", "/api/me", tok_a)
+            me3 = expect("GET /api/me carries isAdmin", r, 200, ["isAdmin"])
+            if me3:
+                check("throwaway user is not admin", me3["isAdmin"] is False, repr(me3["isAdmin"]))
+
         # ---- auth negative paths (use B so A's login budget is untouched)
         r = api("POST", "/api/auth/login", json={"handle": handle_b, "pin": "0000"})
         expect("POST /api/auth/login wrong PIN -> 401", r, 401)
@@ -453,13 +487,15 @@ def print_table():
 
 
 def main():
-    global VERBOSE
+    global VERBOSE, FEEDBACK
     ap = argparse.ArgumentParser(description="MMV smoke test")
     ap.add_argument("--base", default="http://localhost:5000", help="Base URL (default http://localhost:5000)")
     ap.add_argument("--verbose", "-v", action="store_true", help="print every check as it runs")
     ap.add_argument("--json", help="also write results to this JSON file")
+    ap.add_argument("--no-feedback", action="store_true", help="skip POST /api/feedback (it files a real GitHub issue when the server is configured)")
     args = ap.parse_args()
     VERBOSE = args.verbose
+    FEEDBACK = not args.no_feedback
     base = args.base.rstrip("/")
     print(f"MMV smoke test against {base}")
     run(base)

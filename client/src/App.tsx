@@ -7,6 +7,7 @@ import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AuthProvider, useAuth } from "@/lib/auth";
 import { Logo } from "@/components/shell";
+import { ReportProblemHost } from "@/components/report-problem";
 import { getPendingInvite, inviteCodeFromPath, setPendingInvite } from "@/lib/invite";
 import NotFound from "@/pages/not-found";
 import Welcome from "@/pages/welcome";
@@ -64,6 +65,7 @@ function App() {
           <Toaster />
           <Router hook={useHashLocation}>
             <AppRouter />
+            <ReportProblemHost />
           </Router>
         </TooltipProvider>
       </AuthProvider>

@@ -15,8 +15,12 @@ import express from "express";
 export interface FileStore {
   readonly kind: "supabase" | "local";
   init(app: Express): Promise<void>;
-  /** Persist an image; returns the photoPath to store on the pick. */
-  put(buffer: Buffer, ext: string, mime: string): Promise<string>;
+  /**
+   * Persist an image; returns the photoPath to store (absolute public URL on Supabase, /uploads/... locally).
+   * `name` pins the object key (e.g. "feedback/12.png", may contain one folder level) instead of a random one;
+   * an existing object at that key is replaced.
+   */
+  put(buffer: Buffer, ext: string, mime: string, name?: string): Promise<string>;
   /** Best-effort delete of a previously stored photoPath. Never throws. */
   remove(photoPath: string): Promise<void>;
 }
@@ -25,6 +29,12 @@ export const UPLOAD_DIR = path.resolve("uploads");
 
 function objectName(ext: string) {
   return `${Date.now()}-${randomBytes(8).toString("hex")}${ext}`;
+}
+
+/** Only `[a-z0-9_-]` segments with at most one folder level, so a caller can never escape the store root. */
+function safeName(name: string): string {
+  if (!/^[A-Za-z0-9_-]+(\/[A-Za-z0-9_-]+)?\.[A-Za-z0-9]+$/.test(name)) throw new Error(`[files] invalid object name "${name}"`);
+  return name;
 }
 
 class LocalStore implements FileStore {
@@ -48,14 +58,17 @@ class LocalStore implements FileStore {
     app.use("/uploads", (_req, res) => res.status(404).end());
     console.log(`[files] local uploads at ${UPLOAD_DIR}`);
   }
-  async put(buffer: Buffer, ext: string) {
-    const name = objectName(ext);
-    await fs.promises.writeFile(path.join(UPLOAD_DIR, name), buffer);
-    return `/uploads/${name}`;
+  async put(buffer: Buffer, ext: string, _mime: string, name?: string) {
+    const key = name ? safeName(name) : objectName(ext);
+    const file = path.join(UPLOAD_DIR, key);
+    await fs.promises.mkdir(path.dirname(file), { recursive: true });
+    await fs.promises.writeFile(file, buffer);
+    return `/uploads/${key}`;
   }
   async remove(photoPath: string) {
     if (!photoPath.startsWith("/uploads/")) return;
-    const file = path.join(UPLOAD_DIR, path.basename(photoPath));
+    const file = path.resolve(UPLOAD_DIR, photoPath.slice("/uploads/".length).split("?")[0]);
+    if (!file.startsWith(UPLOAD_DIR + path.sep)) return;
     await fs.promises.rm(file, { force: true }).catch(() => {});
   }
 }
@@ -103,10 +116,10 @@ class SupabaseStore implements FileStore {
     console.log(`[files] Supabase Storage bucket "${this.bucket}"`);
   }
 
-  async put(buffer: Buffer, ext: string, mime: string) {
+  async put(buffer: Buffer, ext: string, mime: string, fixedName?: string) {
     const sb = await this.sb();
-    const name = objectName(ext);
-    const { error } = await sb.storage.from(this.bucket).upload(name, buffer, { contentType: mime, cacheControl: "604800", upsert: false });
+    const name = fixedName ? safeName(fixedName) : objectName(ext);
+    const { error } = await sb.storage.from(this.bucket).upload(name, buffer, { contentType: mime, cacheControl: "604800", upsert: Boolean(fixedName) });
     if (error) throw new Error(`Photo upload failed: ${error.message}`);
     return sb.storage.from(this.bucket).getPublicUrl(name).data.publicUrl;
   }

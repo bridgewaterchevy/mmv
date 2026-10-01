@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
-import { Share, SlidersHorizontal } from "lucide-react";
+import { LifeBuoy, Share, SlidersHorizontal } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/lib/auth";
 import { useToast } from "@/hooks/use-toast";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Avatar } from "@/components/shell";
 import { isStandalone, SHOP_FOR_OPTIONS, type ShopFor } from "@/lib/invite";
+import { openReportProblem } from "@/components/report-problem";
 
 /**
  * Segmented control for the "shop for" preference. Tapping the selected segment again clears it
@@ -96,6 +97,20 @@ export function AccountMenu() {
         <p className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Shop for</p>
         <ShopForControl value={user.shopFor ?? null} onChange={change} size="sm" idPrefix="account-shopfor" />
         <p className="mt-2 text-xs text-muted-foreground">Controls which shop links we show under your crew's picks.</p>
+        <div className="-mx-4 mt-3 border-t border-border/70 px-2 pt-2">
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              openReportProblem();
+            }}
+            className="flex w-full items-center gap-2.5 rounded-xl px-2 py-2 text-left text-sm font-medium hover-elevate"
+            data-testid="button-report-problem"
+          >
+            <LifeBuoy className="h-4 w-4 text-primary" aria-hidden />
+            Report a problem
+          </button>
+        </div>
       </PopoverContent>
     </Popover>
   );

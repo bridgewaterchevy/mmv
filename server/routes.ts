@@ -8,6 +8,7 @@ import { files, removeUpload } from "./files";
 import { analyzeOutfit } from "./vision";
 import { lookupOffers, buildShoppingQuery } from "./prices";
 import { presentOffers } from "./affiliate";
+import { registerFeedbackRoutes, isAdmin } from "./feedback";
 import type { User, PricedItem } from "@shared/schema";
 import { ACTIVITIES, SHOP_FOR } from "@shared/schema";
 
@@ -112,8 +113,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ token: user.token, user: toPublic(user) });
   });
 
+  // PublicUser plus `isAdmin` (handle listed in ADMIN_HANDLES → may use the admin feedback endpoints).
   app.get("/api/me", requireAuth, async (req, res) => {
-    res.json(toPublic((req as AuthedRequest).user));
+    const user = (req as AuthedRequest).user;
+    res.json({ ...toPublic(user), isAdmin: isAdmin(user) });
   });
 
   // Profile preferences. Body: { shopFor: "womens" | "mens" | "unisex" | null }. Returns the updated PublicUser.
@@ -299,6 +302,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/closet", requireAuth, async (req, res) => {
     res.json(await storage.picksForUser((req as AuthedRequest).user.id));
   });
+
+  // ---------- "Report a problem" (server/feedback.ts) ----------
+  registerFeedbackRoutes(app, { requireAuth, limited, sniffImage, ip });
 
   return httpServer;
 }

@@ -1,5 +1,6 @@
 import { QueryClient, QueryFunction } from "@tanstack/react-query";
 import { getToken } from "./token";
+import { recordApiError } from "./errorlog";
 
 export const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
 
@@ -9,7 +10,22 @@ export function assetUrl(path: string) {
   return `${API_BASE}${path}`;
 }
 
-async function throwIfResNotOk(res: Response) {
+/** Error thrown for non-2xx responses; `status` lets callers special-case e.g. 429 without parsing text. */
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+/** HTTP status of a caught error, or undefined for network/unknown failures. */
+export function errorStatus(e: unknown): number | undefined {
+  return e instanceof ApiError ? e.status : undefined;
+}
+
+async function throwIfResNotOk(res: Response, method = "GET") {
   if (!res.ok) {
     let message = res.statusText;
     try {
@@ -18,7 +34,9 @@ async function throwIfResNotOk(res: Response) {
     } catch {
       /* ignore */
     }
-    throw new Error(message || `${res.status}`);
+    const text = message || `${res.status}`;
+    recordApiError(method, res.url || "", text, res.status);
+    throw new ApiError(text, res.status);
   }
 }
 
@@ -29,12 +47,19 @@ function authHeaders(): Record<string, string> {
 
 export async function apiRequest(method: string, url: string, data?: unknown): Promise<Response> {
   const isForm = typeof FormData !== "undefined" && data instanceof FormData;
-  const res = await fetch(`${API_BASE}${url}`, {
-    method,
-    headers: { ...authHeaders(), ...(data && !isForm ? { "Content-Type": "application/json" } : {}) },
-    body: isForm ? (data as FormData) : data ? JSON.stringify(data) : undefined,
-  });
-  await throwIfResNotOk(res);
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${url}`, {
+      method,
+      headers: { ...authHeaders(), ...(data && !isForm ? { "Content-Type": "application/json" } : {}) },
+      body: isForm ? (data as FormData) : data ? JSON.stringify(data) : undefined,
+    });
+  } catch (e) {
+    // Offline / DNS / CORS — the server never answered.
+    recordApiError(method, `${API_BASE}${url}`, e instanceof Error ? e.message : String(e));
+    throw e;
+  }
+  await throwIfResNotOk(res, method);
   return res;
 }
 

@@ -1,6 +1,7 @@
 import { pgTable, text, integer, serial, boolean, timestamp } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import type * as z from "zod/mini";
+import { z as zod } from "zod";
 
 // ---------- Users ----------
 /**
@@ -27,7 +28,8 @@ export const insertUserSchema = createInsertSchema(users).pick({
 });
 export type InsertUser = z.infer<typeof insertUserSchema>;
 export type User = typeof users.$inferSelect;
-export type PublicUser = Omit<User, "pin" | "token">;
+/** `isAdmin` is only present on GET /api/me (handle listed in ADMIN_HANDLES); other user payloads omit it. */
+export type PublicUser = Omit<User, "pin" | "token"> & { isAdmin?: boolean };
 
 // ---------- Crews (groups) ----------
 export const ACTIVITIES = [
@@ -224,3 +226,49 @@ export const priceBudget = pgTable("price_budget", {
   day: text("day").primaryKey(), // YYYY-MM-DD (UTC)
   calls: integer("calls").notNull().default(0),
 });
+
+// ---------- Feedback ("Report a problem", see server/feedback.ts + server/github.ts) ----------
+export const FEEDBACK_STATUSES = ["open", "resolved"] as const;
+export type FeedbackStatus = (typeof FEEDBACK_STATUSES)[number];
+
+export const feedback = pgTable("feedback", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull(),
+  message: text("message").notNull(), // 1–2000 chars
+  page: text("page"), // route / URL the user was on
+  userAgent: text("user_agent"),
+  appVersion: text("app_version"),
+  lastError: text("last_error"), // last client-side error (≤ 4000 chars)
+  screenshotPath: text("screenshot_path"), // files.ts path: absolute Supabase URL or /uploads/feedback/<id>.<ext>
+  githubIssueUrl: text("github_issue_url"), // html_url of the filed issue, null when filing was skipped / failed
+  status: text("status").$type<FeedbackStatus>().notNull().default("open"),
+  createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull(),
+});
+export type Feedback = typeof feedback.$inferSelect;
+
+/** One row of GET /api/feedback (admin). `user` is null if the reporter was deleted. */
+export interface FeedbackReport extends Feedback {
+  user: { id: number; name: string; handle: string } | null;
+}
+
+/** Response of POST /api/feedback. */
+export interface FeedbackCreated {
+  id: number;
+  githubIssueUrl: string | null;
+}
+
+/**
+ * Body of POST /api/feedback (JSON or multipart form fields; multipart may add an image file in
+ * the `screenshot` field, ≤ 5 MB, JPG/PNG/WebP/GIF/HEIC). Empty strings are treated as "not set".
+ */
+export const feedbackBodySchema = zod.object({
+  message: zod.string().trim().min(1, "Tell us what went wrong").max(2000, "Keep the message under 2000 characters"),
+  page: zod.string().trim().max(500).optional().nullable(),
+  userAgent: zod.string().trim().max(1000).optional().nullable(),
+  appVersion: zod.string().trim().max(100).optional().nullable(),
+  lastError: zod.string().trim().max(4000, "lastError is limited to 4000 characters").optional().nullable(),
+});
+export type FeedbackBody = zod.infer<typeof feedbackBodySchema>;
+
+/** Body of PATCH /api/feedback/:id (admin). */
+export const feedbackStatusSchema = zod.object({ status: zod.enum(FEEDBACK_STATUSES) });
