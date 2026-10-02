@@ -1,4 +1,4 @@
-import { pgTable, text, integer, serial, boolean, timestamp, jsonb } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, serial, boolean, timestamp, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import type * as z from "zod/mini";
 import { z as zod } from "zod";
@@ -20,7 +20,9 @@ export const users = pgTable("users", {
   color: text("color").notNull(), // avatar hue as hex
   token: text("token").notNull().unique(),
   shopFor: text("shop_for").$type<ShopFor>(), // nullable; see SHOP_FOR
+  bio: text("bio"), // public profile blurb, ≤ USER_BIO_MAX chars, null when unset (PATCH /api/me { bio })
 });
+export const USER_BIO_MAX = 120;
 export const insertUserSchema = createInsertSchema(users).pick({
   name: true,
   handle: true,
@@ -340,3 +342,181 @@ export type FeedbackBody = zod.infer<typeof feedbackBodySchema>;
 
 /** Body of PATCH /api/feedback/:id (admin). */
 export const feedbackStatusSchema = zod.object({ status: zod.enum(FEEDBACK_STATUSES) });
+
+
+// ---------- Discover (public shoppable posts, see server/discover.ts) ----------
+/**
+ * A post is the PUBLIC face of one pick: the owner chooses which of the pick's photos to show, adds a caption and a
+ * vibe tag, and anyone (signed in or not) can browse it on /api/discover, like it, follow the author and shop the
+ * pick's items. Exactly one post per pick (`POST /api/picks/:id/share` creates or updates it). Deleting the pick
+ * deletes the post (FK cascade); removing a photo from the pick drops it from `photoIds` (no photos left → hidden).
+ */
+export const POST_VIBES = [
+  "gym",
+  "run",
+  "pickleball",
+  "golf",
+  "date-night",
+  "girls-night",
+  "guys-night",
+  "brunch",
+  "travel",
+  "other",
+] as const;
+export type PostVibe = (typeof POST_VIBES)[number];
+
+/** active = public; hidden = not listed (auto after POST_REPORTS_TO_HIDE reports, or no public photo left); removed = deleted by owner/admin. */
+export const POST_STATUSES = ["active", "hidden", "removed"] as const;
+export type PostStatus = (typeof POST_STATUSES)[number];
+/** Why a post is hidden/removed; cleared when it is (re)activated. "reports" and "admin" are sticky: re-sharing does not reactivate. */
+export const POST_STATUS_REASONS = ["reports", "no_photos", "owner", "admin"] as const;
+export type PostStatusReason = (typeof POST_STATUS_REASONS)[number];
+
+export const POST_CAPTION_MAX = 140;
+export const POST_REPORT_REASON_MAX = 200;
+/** Distinct reporters after which a post is auto-hidden. */
+export const POST_REPORTS_TO_HIDE = 3;
+export const DISCOVER_PAGE_SIZE = 12;
+export const DISCOVER_TOP_WINDOW_DAYS = 30;
+export const DISCOVER_SORTS = ["new", "top"] as const;
+export type DiscoverSort = (typeof DISCOVER_SORTS)[number];
+
+export const posts = pgTable("posts", {
+  id: serial("id").primaryKey(),
+  pickId: integer("pick_id")
+    .notNull()
+    .unique()
+    .references(() => picks.id, { onDelete: "cascade" }),
+  userId: integer("user_id").notNull(),
+  caption: text("caption"), // ≤ POST_CAPTION_MAX, null when blank
+  vibe: text("vibe").$type<PostVibe>().notNull().default("other"),
+  photoIds: jsonb("photo_ids").$type<number[]>().notNull().default([]), // pick_photos ids chosen for public (subset, position order)
+  likeCount: integer("like_count").notNull().default(0),
+  status: text("status").$type<PostStatus>().notNull().default("active"),
+  statusReason: text("status_reason").$type<PostStatusReason>(),
+  createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" }).notNull().defaultNow(),
+});
+export type Post = typeof posts.$inferSelect;
+
+export const postLikes = pgTable(
+  "post_likes",
+  {
+    id: serial("id").primaryKey(),
+    postId: integer("post_id")
+      .notNull()
+      .references(() => posts.id, { onDelete: "cascade" }),
+    userId: integer("user_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("post_likes_post_user_uq").on(t.postId, t.userId)],
+);
+export type PostLike = typeof postLikes.$inferSelect;
+
+export const follows = pgTable(
+  "follows",
+  {
+    id: serial("id").primaryKey(),
+    followerId: integer("follower_id").notNull(),
+    followeeId: integer("followee_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("follows_pair_uq").on(t.followerId, t.followeeId)],
+);
+export type Follow = typeof follows.$inferSelect;
+
+/**
+ * One report of a post. `userId` is null for anonymous reporters. `reporterKey` ("u:<userId>" or "ip:<ip>") makes
+ * reports distinct per reporter: the same person reporting twice does not add a second row.
+ */
+export const postReports = pgTable(
+  "post_reports",
+  {
+    id: serial("id").primaryKey(),
+    postId: integer("post_id")
+      .notNull()
+      .references(() => posts.id, { onDelete: "cascade" }),
+    userId: integer("user_id"),
+    reporterKey: text("reporter_key").notNull(),
+    reason: text("reason").notNull(), // 1..POST_REPORT_REASON_MAX
+    createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("post_reports_post_reporter_uq").on(t.postId, t.reporterKey)],
+);
+export type PostReport = typeof postReports.$inferSelect;
+
+/** Public author card. `name` is the FIRST NAME only (everything after the first space is dropped). */
+export interface PostAuthor {
+  id: number;
+  name: string;
+  handle: string;
+  color: string;
+  isFollowedByMe: boolean;
+}
+
+/**
+ * Public view of a post. Safe for anonymous readers: never carries the pick's note, crew/session data, the owner's
+ * shopFor/token, or photos the owner did not pick for the post. `pickId` is only filled for the owner/admins.
+ */
+export interface PostView {
+  id: number;
+  caption: string | null;
+  vibe: PostVibe;
+  createdAt: string; // ISO
+  likeCount: number;
+  likedByMe: boolean; // false when anonymous
+  photos: { id: number; url: string }[]; // only the chosen public photos, pick position order
+  items: GarmentItem[]; // the pick's aggregated items, decorated like PickView.items (shoppingQuery, affiliate links)
+  palette: string[];
+  analysisStatus: AnalysisStatus;
+  author: PostAuthor;
+  isMine: boolean;
+  status: PostStatus;
+  pickId: number | null;
+}
+
+/** Page of GET /api/discover and GET /api/users/:handle/posts. Pass `nextCursor` back as ?cursor= ; null = last page. */
+export interface DiscoverPage {
+  posts: PostView[];
+  nextCursor: string | null;
+}
+
+/** GET /api/users/:handle (public). */
+export interface PublicProfile {
+  id: number;
+  name: string; // first name only
+  handle: string;
+  color: string;
+  bio: string | null;
+  followerCount: number;
+  followingCount: number;
+  postCount: number; // active posts
+  isFollowedByMe: boolean;
+  isMe: boolean;
+}
+
+/** Row of GET /api/admin/reports. */
+export interface PostReportView extends PostReport {
+  reporter: { id: number; name: string; handle: string } | null;
+  postStatus: PostStatus;
+  postAuthorHandle: string | null;
+}
+
+/** Body of POST /api/picks/:id/share. `photoIds` omitted on create = every photo of the pick; omitted on update = keep. */
+export const sharePostBodySchema = zod.object({
+  caption: zod.string().trim().max(POST_CAPTION_MAX, `Keep the caption under ${POST_CAPTION_MAX} characters`).optional().nullable(),
+  vibe: zod.enum(POST_VIBES, { message: `vibe must be one of ${POST_VIBES.join(", ")}` }),
+  photoIds: zod.array(zod.number().int().positive()).min(1, "Pick at least one photo").max(12).optional(),
+});
+export type SharePostBody = zod.infer<typeof sharePostBodySchema>;
+
+/** Body of POST /api/posts/:id/report. */
+export const postReportBodySchema = zod.object({
+  reason: zod.string().trim().min(1, "Tell us what's wrong with this post").max(POST_REPORT_REASON_MAX, `Keep the reason under ${POST_REPORT_REASON_MAX} characters`),
+});
+
+/** Body of PATCH /api/admin/posts/:id. */
+export const postStatusSchema = zod.object({ status: zod.enum(POST_STATUSES, { message: "status must be active, hidden or removed" }) });
+
+/** `bio` part of PATCH /api/me ("" and null clear it). */
+export const bioSchema = zod.string().trim().max(USER_BIO_MAX, `Keep the bio under ${USER_BIO_MAX} characters`).nullable();

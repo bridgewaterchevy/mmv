@@ -9,8 +9,9 @@ import { enqueueAnalysis, recoverStuckAnalyses, startAnalysisSweeper } from "./a
 import { lookupOffers, buildShoppingQuery } from "./prices";
 import { presentOffers } from "./affiliate";
 import { registerFeedbackRoutes, isAdmin } from "./feedback";
-import type { User, PricedItem } from "@shared/schema";
-import { ACTIVITIES, SHOP_FOR, PICK_MAX_PHOTOS_DEFAULT } from "@shared/schema";
+import { registerDiscoverRoutes } from "./discover";
+import type { User, PricedItem, PickView } from "@shared/schema";
+import { ACTIVITIES, SHOP_FOR, PICK_MAX_PHOTOS_DEFAULT, bioSchema } from "@shared/schema";
 
 /** Photos per pick (upload + later additions). PICK_MAX_PHOTOS env, default 6, clamped to 1..12. */
 const PICK_MAX_PHOTOS = Math.min(12, Math.max(1, Number(process.env.PICK_MAX_PHOTOS || PICK_MAX_PHOTOS_DEFAULT) || PICK_MAX_PHOTOS_DEFAULT));
@@ -125,17 +126,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ token: user.token, user: toPublic(user) });
   });
 
-  // PublicUser plus `isAdmin` (handle listed in ADMIN_HANDLES → may use the admin feedback endpoints).
+  // PublicUser plus `isAdmin` (handle listed in ADMIN_HANDLES → may use the admin endpoints) and the Discover
+  // counters `postCount` (active posts) / `followerCount` / `followingCount`.
   app.get("/api/me", requireAuth, async (req, res) => {
     const user = (req as AuthedRequest).user;
-    res.json({ ...toPublic(user), isAdmin: isAdmin(user) });
+    const counts = await storage.profileCounts(user.id);
+    res.json({ ...toPublic(user), isAdmin: isAdmin(user), ...counts });
   });
 
-  // Profile preferences. Body: { shopFor: "womens" | "mens" | "unisex" | null }. Returns the updated PublicUser.
+  // Profile preferences. Body: { shopFor?: "womens" | "mens" | "unisex" | null, bio?: string | null } — at least one key.
+  // bio ≤ 120 chars; "" or null clears it. Returns the updated PublicUser.
   app.patch("/api/me", requireAuth, async (req, res) => {
-    const body = z.object({ shopFor: shopForSchema }).safeParse(req.body);
+    const body = z.object({ shopFor: shopForSchema.optional(), bio: bioSchema.optional() }).safeParse(req.body);
     if (!body.success) return res.status(400).json({ message: body.error.issues[0]?.message ?? "Invalid" });
-    const user = await storage.updateUser((req as AuthedRequest).user.id, { shopFor: body.data.shopFor });
+    if (body.data.shopFor === undefined && body.data.bio === undefined) return res.status(400).json({ message: "Send shopFor and/or bio" });
+    const user = await storage.updateUser((req as AuthedRequest).user.id, { shopFor: body.data.shopFor, bio: body.data.bio });
     res.json(toPublic(user));
   });
 
@@ -420,14 +425,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Looks up the first 4 items concurrently (each lookup is cached 24h and budget-guarded in server/prices.ts).
   // The query carries a women's/men's hint from the PICK OWNER's shopFor (the outfit is theirs), else the
   // garment's vision `fit` — see buildShoppingQuery. The hinted string is the price_cache key.
-  app.get("/api/picks/:id/prices", requireAuth, async (req, res) => {
-    const pick = await storage.getPick(Number(req.params.id));
-    const user = (req as AuthedRequest).user;
-    if (!pick) return res.status(404).json({ message: "Pick not found" });
-    const s = await storage.getSession(pick.sessionId);
-    if (!s || !(await storage.isMember(s.crewId, user.id))) return res.status(403).json({ message: "Not your crew" });
-    if (limited(`prices:${user.id}`, 120, 60 * 60 * 1000)) return res.status(429).json({ message: "Slow down a little." });
-    const view = await storage.pickView(pick); // items already hinted (shoppingQuery) + affiliate-wrapped
+  // Shared with the public GET /api/posts/:id/prices (server/discover.ts): one pipeline, one budget, one cache.
+  const priceItems = async (view: PickView): Promise<PricedItem[]> => {
     const offerLists = await Promise.all(
       view.items.slice(0, 4).map((it) =>
         lookupOffers(it.shoppingQuery || buildShoppingQuery(it, view.user)).catch((err) => {
@@ -436,8 +435,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         }),
       ),
     );
-    const items: PricedItem[] = view.items.map((it, i) => ({ ...it, offers: presentOffers(offerLists[i] ?? []) }));
-    res.json({ pickId: pick.id, items });
+    return view.items.map((it, i) => ({ ...it, offers: presentOffers(offerLists[i] ?? []) }));
+  };
+  app.get("/api/picks/:id/prices", requireAuth, async (req, res) => {
+    const pick = await storage.getPick(Number(req.params.id));
+    const user = (req as AuthedRequest).user;
+    if (!pick) return res.status(404).json({ message: "Pick not found" });
+    const s = await storage.getSession(pick.sessionId);
+    if (!s || !(await storage.isMember(s.crewId, user.id))) return res.status(403).json({ message: "Not your crew" });
+    if (limited(`prices:${user.id}`, 120, 60 * 60 * 1000)) return res.status(429).json({ message: "Slow down a little." });
+    const view = await storage.pickView(pick); // items already hinted (shoppingQuery) + affiliate-wrapped
+    res.json({ pickId: pick.id, items: await priceItems(view) });
   });
 
   // ---------- closet (wear history) ----------
@@ -447,6 +455,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // ---------- "Report a problem" (server/feedback.ts) ----------
   registerFeedbackRoutes(app, { requireAuth, limited, sniffImage, ip });
+
+  // ---------- Discover: public posts, likes, follows, reports, admin moderation (server/discover.ts) ----------
+  registerDiscoverRoutes(app, { requireAuth, limited, ip, priceItems });
 
   return httpServer;
 }

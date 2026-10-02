@@ -13,6 +13,8 @@ afterwards flips it to "failed" (no Gemini here: analysisError set, analysisFail
 POST /api/picks/:id/analyze (owner only, 403 otherwise) re-queues the same way.
 Multi-photo picks: 1..6 files under `photo` -> photos[] (position order); pick-level status/items are aggregates;
 POST /api/picks/:id/photos, DELETE /api/picks/:id/photos/:photoId (last -> 400), POST .../photos/:photoId/analyze.
+Discover (public): POST /api/picks/:id/share, GET /api/discover, GET /api/posts/:id(/prices), POST .../like, .../report,
+GET /api/users/:handle(/posts), POST .../follow, PATCH /api/me {bio}, DELETE /api/posts/:id; admin routes always 403.
 """
 import json
 import re
@@ -24,8 +26,10 @@ from email.policy import HTTP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SHOP_FOR = ("womens", "mens", "unisex")
-DB = {"users": {}, "tokens": {}, "crews": {}, "sessions": {}, "picks": {}, "reactions": [], "files": {}}
-SEQ = {"u": 0, "c": 0, "s": 0, "p": 0, "ph": 0}
+DB = {"users": {}, "tokens": {}, "crews": {}, "sessions": {}, "picks": {}, "reactions": [], "files": {},
+      "posts": {}, "likes": set(), "follows": set(), "reports": {}}
+SEQ = {"u": 0, "c": 0, "s": 0, "p": 0, "ph": 0, "po": 0, "rp": 0}
+VIBES = ("gym", "run", "pickleball", "golf", "date-night", "girls-night", "guys-night", "brunch", "travel", "other")
 MAX_PHOTOS = 6
 LOGIN_ATTEMPTS = {}
 
@@ -37,6 +41,31 @@ def nid(k):
 
 def pub(u):
     return {k: v for k, v in u.items() if k not in ("pin", "token")}
+
+
+def first_name(u):
+    return (u["name"].strip().split() or [u["handle"]])[0]
+
+
+def post_view(po, viewer):
+    pk = DB["picks"][po["pickId"]]
+    aggregate(pk)
+    author = DB["users"][po["userId"]]
+    mine = bool(viewer) and viewer["id"] == po["userId"]
+    return {"id": po["id"], "caption": po["caption"], "vibe": po["vibe"], "createdAt": po["createdAt"], "likeCount": po["likeCount"],
+            "likedByMe": bool(viewer) and (po["id"], viewer["id"]) in DB["likes"],
+            "photos": [{"id": x["id"], "url": x["path"]} for x in sorted(pk["photos"], key=lambda x: x["position"]) if x["id"] in po["photoIds"]],
+            "items": [dict(i, shoppingQuery=i.get("searchQuery", "")) for i in pk["items"]], "palette": pk["palette"], "analysisStatus": pk["analysisStatus"],
+            "author": {"id": author["id"], "name": first_name(author), "handle": author["handle"], "color": author["color"],
+                       "isFollowedByMe": bool(viewer) and (viewer["id"], author["id"]) in DB["follows"]},
+            "isMine": mine, "status": po["status"], "pickId": po["pickId"] if mine else None}
+
+
+def profile(u, viewer):
+    return {"id": u["id"], "name": first_name(u), "handle": u["handle"], "color": u["color"], "bio": u.get("bio"),
+            "followerCount": sum(1 for a, b in DB["follows"] if b == u["id"]), "followingCount": sum(1 for a, b in DB["follows"] if a == u["id"]),
+            "postCount": sum(1 for p in DB["posts"].values() if p["userId"] == u["id"] and p["status"] == "active"),
+            "isFollowedByMe": bool(viewer) and (viewer["id"], u["id"]) in DB["follows"], "isMe": bool(viewer) and viewer["id"] == u["id"]}
 
 
 def new_photo(path, position):
@@ -163,11 +192,40 @@ class H(BaseHTTPRequestHandler):
         if p.startswith("/uploads/"):
             f = DB["files"].get(p)
             return self.send(200, raw=f, ctype="image/jpeg") if f else self.send(404, raw=b"")
-        u = self.user()
+        viewer = self.user()
+        path, _, qs = p.partition("?")
+        q = dict(x.split("=", 1) for x in qs.split("&") if "=" in x)
+        if path == "/api/discover":
+            if q.get("sort", "new") not in ("new", "top") or ("vibe" in q and q["vibe"] not in VIBES) or ("cursor" in q and q["cursor"]):
+                return self.send(400, {"message": "Bad query"})
+            rows = [x for x in DB["posts"].values() if x["status"] == "active" and (not q.get("vibe") or x["vibe"] == q["vibe"])]
+            rows.sort(key=lambda x: ((-x["likeCount"],) if q.get("sort") == "top" else ()) + (x["createdAt"], x["id"]), reverse=q.get("sort") != "top")
+            return self.send(200, {"posts": [post_view(x, viewer) for x in rows[:12]], "nextCursor": None}, extra={"Cache-Control": "no-store"})
+        m = re.fullmatch(r"/api/posts/(\d+)(/prices)?", path)
+        if m:
+            po = DB["posts"].get(int(m[1]))
+            if not po or (po["status"] != "active" and not (viewer and viewer["id"] == po["userId"])):
+                return self.send(404, {"message": "Post not found"})
+            if m[2]:
+                return self.send(200, {"postId": po["id"], "items": [dict(i, offers=[]) for i in post_view(po, viewer)["items"]]})
+            return self.send(200, post_view(po, viewer), extra={"Cache-Control": "no-store"})
+        m = re.fullmatch(r"/api/users/@?([A-Za-z0-9_]+)(/posts)?", path)
+        if m:
+            target = next((x for x in DB["users"].values() if x["handle"] == m[1].lower()), None)
+            if not target:
+                return self.send(404, {"message": "No one with that handle"})
+            if m[2]:
+                rows = sorted([x for x in DB["posts"].values() if x["userId"] == target["id"] and x["status"] == "active"], key=lambda x: x["id"], reverse=True)
+                return self.send(200, {"posts": [post_view(x, viewer) for x in rows[:12]], "nextCursor": None}, extra={"Cache-Control": "no-store"})
+            return self.send(200, profile(target, viewer), extra={"Cache-Control": "no-store"})
+        u = viewer
         if not u:
             return self.send(401, {"message": "Sign in first"})
+        if path.startswith("/api/admin/"):
+            return self.send(403, {"message": "Admins only"})
         if p == "/api/me":
-            return self.send(200, pub(u))
+            pr = profile(u, u)
+            return self.send(200, dict(pub(u), isAdmin=False, postCount=pr["postCount"], followerCount=pr["followerCount"], followingCount=pr["followingCount"]))
         if p == "/api/crews":
             return self.send(200, [crew_view(c) for c in DB["crews"].values() if u["id"] in c["members"]])
         m = re.fullmatch(r"/api/crews/(\d+)", p)
@@ -236,7 +294,7 @@ class H(BaseHTTPRequestHandler):
             sf = js.get("shopFor")
             if sf is not None and sf not in SHOP_FOR:
                 return self.send(400, {"message": "shopFor must be womens, mens or unisex"})
-            u = {"id": nid("u"), "name": name, "handle": h.lower(), "pin": pin, "color": "#ff00aa", "token": secrets.token_hex(16), "shopFor": sf}
+            u = {"id": nid("u"), "name": name, "handle": h.lower(), "pin": pin, "color": "#ff00aa", "token": secrets.token_hex(16), "shopFor": sf, "bio": None}
             DB["users"][u["id"]] = u
             DB["tokens"][u["token"]] = u["id"]
             return self.send(200, {"token": u["token"], "user": pub(u)})
@@ -256,8 +314,66 @@ class H(BaseHTTPRequestHandler):
                 return self.send(401, {"message": "Wrong handle or PIN"})
             return self.send(200, {"token": u["token"], "user": pub(u)})
         u = self.user()
+        m = re.fullmatch(r"/api/posts/(\d+)/report", p)
+        if m:
+            po = DB["posts"].get(int(m[1]))
+            if not po or po["status"] == "removed":
+                return self.send(404, {"message": "Post not found"})
+            reason = str(js.get("reason") or "").strip()
+            if not reason or len(reason) > 200:
+                return self.send(400, {"message": "Tell us what's wrong with this post"})
+            if u and u["id"] == po["userId"]:
+                return self.send(400, {"message": "You can't report your own post"})
+            key = f"u:{u['id']}" if u else f"ip:{self.client_address[0]}"
+            DB["reports"].setdefault(po["id"], {})[key] = reason
+            n = len(DB["reports"][po["id"]])
+            if n >= 3 and po["status"] == "active":
+                po["status"] = "hidden"
+            return self.send(201, {"id": nid("rp"), "reportCount": n, "hidden": po["status"] == "hidden"}, extra={"Cache-Control": "no-store"})
         if not u:
             return self.send(401, {"message": "Sign in first"})
+        if p.startswith("/api/admin/"):
+            return self.send(403, {"message": "Admins only"})
+        m = re.fullmatch(r"/api/picks/(\d+)/share", p)
+        if m:
+            pk = DB["picks"].get(int(m[1]))
+            if not pk:
+                return self.send(404, {"message": "Pick not found"})
+            if pk["userId"] != u["id"]:
+                return self.send(403, {"message": "Only the owner can share this pick"})
+            if js.get("vibe") not in VIBES or len(str(js.get("caption") or "")) > 140:
+                return self.send(400, {"message": "Invalid"})
+            ids = [x["id"] for x in pk["photos"]]
+            chosen = js.get("photoIds")
+            if chosen is not None and (not chosen or any(i not in ids for i in chosen)):
+                return self.send(400, {"message": "photoIds must be photos of this pick"})
+            po = next((x for x in DB["posts"].values() if x["pickId"] == pk["id"]), None)
+            if not po:
+                po = {"id": nid("po"), "pickId": pk["id"], "userId": u["id"], "likeCount": 0, "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ"), "photoIds": ids}
+                DB["posts"][po["id"]] = po
+            po.update(caption=(str(js.get("caption") or "").strip() or None), vibe=js["vibe"], status="active", photoIds=chosen or po["photoIds"] or ids)
+            return self.send(201, post_view(po, u), extra={"Cache-Control": "no-store"})
+        m = re.fullmatch(r"/api/posts/(\d+)/like", p)
+        if m:
+            po = DB["posts"].get(int(m[1]))
+            if not po or po["status"] != "active":
+                return self.send(404, {"message": "Post not found"})
+            key = (po["id"], u["id"])
+            liked = key not in DB["likes"]
+            (DB["likes"].add if liked else DB["likes"].discard)(key)
+            po["likeCount"] = sum(1 for k in DB["likes"] if k[0] == po["id"])
+            return self.send(200, {"likeCount": po["likeCount"], "likedByMe": liked})
+        m = re.fullmatch(r"/api/users/@?([A-Za-z0-9_]+)/follow", p)
+        if m:
+            target = next((x for x in DB["users"].values() if x["handle"] == m[1].lower()), None)
+            if not target:
+                return self.send(404, {"message": "No one with that handle"})
+            if target["id"] == u["id"]:
+                return self.send(400, {"message": "You can't follow yourself"})
+            key = (u["id"], target["id"])
+            following = key not in DB["follows"]
+            (DB["follows"].add if following else DB["follows"].discard)(key)
+            return self.send(200, {"following": following, "followerCount": sum(1 for a, b in DB["follows"] if b == target["id"])})
         if p == "/api/crews":
             if not js.get("name") or js.get("activity") not in ("Gym", "CrossFit", "Run club", "Brunch", "Other", "Date night"):
                 return self.send(400, {"message": "Give the crew a name and an activity"})
@@ -359,10 +475,19 @@ class H(BaseHTTPRequestHandler):
         u = self.user()
         if not u:
             return self.send(401, {"message": "Sign in first"})
+        if p.startswith("/api/admin/"):
+            return self.send(403, {"message": "Admins only"})
         if p == "/api/me":
-            if "shopFor" not in js or (js["shopFor"] is not None and js["shopFor"] not in SHOP_FOR):
+            if "shopFor" not in js and "bio" not in js:
+                return self.send(400, {"message": "Send shopFor and/or bio"})
+            if "shopFor" in js and js["shopFor"] is not None and js["shopFor"] not in SHOP_FOR:
                 return self.send(400, {"message": "shopFor must be womens, mens or unisex"})
-            u["shopFor"] = js["shopFor"]
+            if "bio" in js and js["bio"] is not None and len(str(js["bio"]).strip()) > 120:
+                return self.send(400, {"message": "Keep the bio under 120 characters"})
+            if "shopFor" in js:
+                u["shopFor"] = js["shopFor"]
+            if "bio" in js:
+                u["bio"] = (str(js["bio"]).strip() or None) if js["bio"] is not None else None
             return self.send(200, pub(u))
         m = re.fullmatch(r"/api/sessions/(\d+)", p)
         if m:
@@ -388,12 +513,23 @@ class H(BaseHTTPRequestHandler):
         u = self.user()
         if not u:
             return self.send(401, {"message": "Sign in first"})
+        m = re.fullmatch(r"/api/posts/(\d+)", self.path)
+        if m:
+            po = DB["posts"].get(int(m[1]))
+            if not po or po["status"] == "removed":
+                return self.send(404, {"message": "Post not found"})
+            if po["userId"] != u["id"]:
+                return self.send(403, {"message": "Only the owner can remove this post"})
+            po["status"] = "removed"
+            return self.send(200, {"ok": True, "id": po["id"], "status": "removed"})
         m = re.fullmatch(r"/api/picks/(\d+)", self.path)
         if m:
             pk = DB["picks"].get(int(m[1]))
             if not pk or pk["userId"] != u["id"]:
                 return self.send(404, {"message": "Pick not found"})
             DB["picks"].pop(pk["id"])
+            for po in [x for x in DB["posts"].values() if x["pickId"] == pk["id"]]:
+                DB["posts"].pop(po["id"])
             for ph in pk["photos"]:
                 DB["files"].pop(ph["path"], None)
             return self.send(200, {"ok": True})

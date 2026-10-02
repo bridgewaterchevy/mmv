@@ -3,6 +3,7 @@ import type { PublicUser } from "@shared/schema";
 import { apiJson, queryClient } from "./queryClient";
 import { getToken, setToken } from "./token";
 import { getPendingInvite, isShopFor, type ShopFor } from "./invite";
+import { consumeReturnTo } from "./discover";
 
 /** Auth user as the client sees it. `shopFor` is optional so older servers still type-check. */
 export type AppUser = PublicUser & { shopFor?: ShopFor | null };
@@ -44,8 +45,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setToken(res.token);
     setUser(normalizeUser(res.user));
     queryClient.clear();
-    // A pending invite is picked up by <InviteGate /> once the signed-in tree mounts; otherwise land on Crews.
-    if (!getPendingInvite() && window.location.hash && window.location.hash !== "#/") window.location.hash = "#/";
+    // A pending invite is picked up by <InviteGate /> once the signed-in tree mounts. A visitor who came from a
+    // public Discover page (tapped Like / Follow while logged out) goes back there; otherwise land on Crews.
+    if (getPendingInvite()) return;
+    const returnTo = consumeReturnTo();
+    if (returnTo) window.location.hash = `#${returnTo}`;
+    else if (window.location.hash && window.location.hash !== "#/") window.location.hash = "#/";
   }, []);
 
   const signup = useCallback(

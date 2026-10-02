@@ -22,7 +22,10 @@ What it does (end to end, with two throwaway users):
      B deletes photo 0 (200, renumbered, cover moves) -> per-photo retry (200/202) -> deleting the last photo 400
   -> lazy prices for A's pick (200 {items}; offers may be
      empty without SERPAPI_KEY/HASDATA_API_KEY) -> lock/unlock pick -> emoji + comment reactions
-  -> closet -> report a problem (POST /api/feedback 200 {id, kind, githubIssueUrl}, kind=suggestion 200,
+  -> closet -> Discover: share A's pick (401 / 403 non-owner / 201 PostView), public feed + post + prices without a
+     token, privacy (no note / crew name / session id / invite code in public payloads), like + follow toggles,
+     public profile (first name, bio via PATCH /api/me, counts), report (201), admin routes 403, owner delete -> 404
+  -> report a problem (POST /api/feedback 200 {id, kind, githubIssueUrl}, kind=suggestion 200,
      bad kind 400, missing message 400, admin endpoints 403 for a normal user) -> wrong PIN 401 -> repeated wrong PINs 429 -> no-token 401
   -> delete picks (cleanup).
 
@@ -62,6 +65,7 @@ ANALYSIS_STATUSES = ("pending", "ready", "failed")
 RESULTS = []  # (name, ok, detail)
 VERBOSE = False
 FEEDBACK = True  # --no-feedback skips the "report a problem" step (avoids filing a GitHub issue)
+DISCOVER = True  # --no-discover skips the public Discover steps (share / feed / like / follow / report)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -594,6 +598,125 @@ def run(base):
             check("closet is a list containing our pick", isinstance(closet, list) and any(p.get("id") == pid_a for p in closet),
                   f"{len(closet) if isinstance(closet, list) else closet}")
 
+        # ---- Discover (public shoppable posts). Uses A's pick; the post is removed again at the end (and the pick
+        #      deletion in cleanup cascades anyway). Throwaway users are never in ADMIN_HANDLES -> admin routes 403.
+        if DISCOVER:
+            r = api("POST", f"/api/picks/{pid_a}/share", json={"vibe": "gym"})
+            expect("POST /api/picks/:id/share without token -> 401", r, 401)
+            r = api("POST", f"/api/picks/{pid_a}/share", tok_b, json={"vibe": "gym"})
+            expect("POST /api/picks/:id/share by non-owner (B) -> 403", r, 403)
+            r = api("POST", f"/api/picks/{pid_a}/share", tok_a, json={"vibe": "skydiving"})
+            expect("POST /api/picks/:id/share bad vibe -> 400", r, 400)
+            r = api("POST", f"/api/picks/{pid_a}/share", tok_a, json={"vibe": "gym", "caption": "smoke share"})
+            post = expect("POST /api/picks/:id/share (owner A) -> 201 PostView", r, 201,
+                          ["id", "caption", "vibe", "createdAt", "likeCount", "likedByMe", "photos", "items", "palette", "analysisStatus", "author", "isMine", "status"])
+            if post:
+                post_id = post["id"]
+                check("share: status active, isMine, caption, 1 public photo {id,url}, author first name 'Smoke'",
+                      post["status"] == "active" and post["isMine"] is True and post["caption"] == "smoke share" and len(post["photos"]) == 1
+                      and set(post["photos"][0]) == {"id", "url"} and post["author"].get("name") == "Smoke" and post["author"].get("handle", "").lower() == handle_a.lower(),
+                      str(post)[:200])
+                # public reads (no token)
+                r = api("GET", "/api/discover")
+                feed = expect("GET /api/discover (no token) -> 200 {posts, nextCursor}", r, 200, ["posts", "nextCursor"])
+                if feed:
+                    check("discover: Cache-Control: no-store", "no-store" in r.headers.get("Cache-Control", "").lower(), repr(r.headers.get("Cache-Control")))
+                    check("discover: feed contains the new post", any(p.get("id") == post_id for p in feed["posts"]), f"{len(feed['posts'])} posts")
+                    check("discover: anonymous posts have likedByMe false / isMine false / pickId null",
+                          all(p.get("likedByMe") is False and p.get("isMine") is False and p.get("pickId") is None for p in feed["posts"]))
+                r = api("GET", f"/api/posts/{post_id}")
+                pub = expect("GET /api/posts/:id (no token) -> 200 PostView", r, 200, ["id", "photos", "items", "author", "likedByMe"])
+                if pub:
+                    blob = json.dumps(pub) + json.dumps(feed or {})
+                    check("privacy: public payloads carry no pick note / crew name / sessionId / inviteCode / shopFor / full name",
+                          not any(x in blob for x in ("smoke test fit", "Smoke Crew", '"sessionId"', '"inviteCode"', '"shopFor"', "Smoke A", '"note"')),
+                          [x for x in ("smoke test fit", "Smoke Crew", '"sessionId"', '"inviteCode"', '"shopFor"', "Smoke A", '"note"') if x in blob])
+                    check("public post: items mirror the pick's items", len(pub["items"]) == len(pick_a["items"]), f"{len(pub['items'])} vs {len(pick_a['items'])}")
+                r = api("GET", f"/api/discover?vibe=gym")
+                vf = expect("GET /api/discover?vibe=gym -> 200", r, 200, ["posts"])
+                if vf:
+                    check("vibe filter: only gym posts, includes ours", all(p["vibe"] == "gym" for p in vf["posts"]) and any(p["id"] == post_id for p in vf["posts"]))
+                r = api("GET", "/api/discover?vibe=bogus")
+                expect("GET /api/discover?vibe=bogus -> 400", r, 400)
+                r = api("GET", "/api/discover?sort=top")
+                expect("GET /api/discover?sort=top -> 200", r, 200, ["posts"])
+                r = api("GET", "/api/discover?cursor=not-a-cursor")
+                expect("GET /api/discover bad cursor -> 400", r, 400)
+                r = api("GET", f"/api/posts/{post_id}/prices", timeout=60)
+                pp = expect("GET /api/posts/:id/prices (no token) -> 200 {postId, items}", r, 200, ["postId", "items"])
+                if pp:
+                    check("post prices: one entry per item, each with offers[]", len(pp["items"]) == len(pick_a["items"]) and all(isinstance(i.get("offers"), list) for i in pp["items"]))
+                # like
+                r = api("POST", f"/api/posts/{post_id}/like")
+                expect("POST /api/posts/:id/like without token -> 401", r, 401)
+                r = api("POST", f"/api/posts/{post_id}/like", tok_b)
+                lk = expect("POST /api/posts/:id/like (B) -> 200 {likeCount, likedByMe}", r, 200, ["likeCount", "likedByMe"])
+                if lk:
+                    check("like: likeCount 1, likedByMe true", lk == {"likeCount": 1, "likedByMe": True}, str(lk))
+                    g = api("GET", f"/api/posts/{post_id}", tok_b)
+                    check("GET post as B shows likedByMe true", g.ok and g.json().get("likedByMe") is True and g.json().get("likeCount") == 1)
+                    r = api("POST", f"/api/posts/{post_id}/like", tok_b)
+                    check("like toggles off", r.ok and r.json() == {"likeCount": 0, "likedByMe": False}, r.text[:100])
+                # follow + profile
+                r = api("POST", f"/api/users/{handle_a}/follow", tok_a)
+                expect("POST /api/users/:handle/follow self -> 400", r, 400)
+                r = api("POST", f"/api/users/{handle_a}/follow", tok_b)
+                fl = expect("POST /api/users/:handle/follow (B -> A) -> 200 {following, followerCount}", r, 200, ["following", "followerCount"])
+                if fl:
+                    check("follow: following true, followerCount 1", fl == {"following": True, "followerCount": 1}, str(fl))
+                r = api("GET", f"/api/users/{handle_a}", tok_b)
+                prof = expect("GET /api/users/:handle (B) -> 200 profile", r, 200, ["id", "name", "handle", "color", "bio", "followerCount", "followingCount", "postCount", "isFollowedByMe", "isMe"])
+                if prof:
+                    check("profile: first name 'Smoke', followerCount 1, postCount 1, isFollowedByMe true, isMe false",
+                          prof["name"] == "Smoke" and prof["followerCount"] == 1 and prof["postCount"] == 1 and prof["isFollowedByMe"] is True and prof["isMe"] is False, str(prof))
+                r = api("GET", f"/api/users/{handle_a}/posts")
+                up = expect("GET /api/users/:handle/posts (no token) -> 200", r, 200, ["posts", "nextCursor"])
+                if up:
+                    check("user posts contain the shared post", any(p["id"] == post_id for p in up["posts"]))
+                r = api("GET", "/api/users/nobody_zz_" + handle_a[-4:])
+                expect("GET /api/users/:handle unknown -> 404", r, 404)
+                r = api("PATCH", "/api/me", tok_a, json={"bio": "smoke bio"})
+                pb = expect("PATCH /api/me {bio} -> 200", r, 200, ["bio"])
+                if pb:
+                    check("bio saved", pb["bio"] == "smoke bio", repr(pb.get("bio")))
+                    check("profile shows the bio", api("GET", f"/api/users/{handle_a}").json().get("bio") == "smoke bio")
+                r = api("PATCH", "/api/me", tok_a, json={"bio": "x" * 121})
+                expect("PATCH /api/me bio > 120 -> 400", r, 400)
+                r = api("GET", "/api/me", tok_a)
+                mec = expect("GET /api/me carries postCount / followerCount", r, 200, ["postCount", "followerCount"])
+                if mec:
+                    check("/api/me counts: postCount 1, followerCount 1", mec["postCount"] == 1 and mec["followerCount"] == 1, f"{mec.get('postCount')} {mec.get('followerCount')}")
+                r = api("POST", f"/api/users/{handle_a}/follow", tok_b)
+                check("follow toggles off", r.ok and r.json() == {"following": False, "followerCount": 0}, r.text[:100])
+                # report (one report only: 3 distinct reporters would hide the post)
+                r = api("POST", f"/api/posts/{post_id}/report", tok_a, json={"reason": "own"})
+                expect("POST /api/posts/:id/report own post -> 400", r, 400)
+                r = api("POST", f"/api/posts/{post_id}/report", tok_b, json={"reason": "[smoke] test report"})
+                rp = expect("POST /api/posts/:id/report (B) -> 201 {id, reportCount, hidden}", r, 201, ["id", "reportCount", "hidden"])
+                if rp:
+                    check("report: reportCount 1, hidden false", rp["reportCount"] == 1 and rp["hidden"] is False, str(rp))
+                r = api("POST", f"/api/posts/{post_id}/report", tok_b, json={"reason": ""})
+                expect("POST /api/posts/:id/report empty reason -> 400", r, 400)
+                # admin gating
+                r = api("GET", "/api/admin/posts", tok_a)
+                expect("GET /api/admin/posts as non-admin -> 403", r, 403)
+                r = api("GET", "/api/admin/reports", tok_a)
+                expect("GET /api/admin/reports as non-admin -> 403", r, 403)
+                r = api("PATCH", f"/api/admin/posts/{post_id}", tok_a, json={"status": "hidden"})
+                expect("PATCH /api/admin/posts/:id as non-admin -> 403", r, 403)
+                # owner delete
+                r = api("DELETE", f"/api/posts/{post_id}", tok_b)
+                expect("DELETE /api/posts/:id by non-owner (B) -> 403", r, 403)
+                r = api("DELETE", f"/api/posts/{post_id}", tok_a)
+                dl = expect("DELETE /api/posts/:id by owner -> 200 {ok, status}", r, 200, ["ok", "status"])
+                if dl:
+                    check("deleted post status removed", dl["status"] == "removed", str(dl))
+                r = api("GET", f"/api/posts/{post_id}")
+                expect("GET deleted post (no token) -> 404", r, 404)
+                r = api("GET", "/api/discover")
+                if r.ok:
+                    check("deleted post out of the feed", all(p["id"] != post_id for p in r.json()["posts"]))
+
         # ---- report a problem (feedback). Throwaway users are never in ADMIN_HANDLES -> admin routes 403.
         if FEEDBACK:
             r = api("POST", "/api/feedback", tok_a, json={
@@ -697,15 +820,17 @@ def print_table():
 
 
 def main():
-    global VERBOSE, FEEDBACK
+    global VERBOSE, FEEDBACK, DISCOVER
     ap = argparse.ArgumentParser(description="MMV smoke test")
     ap.add_argument("--base", default="http://localhost:5000", help="Base URL (default http://localhost:5000)")
     ap.add_argument("--verbose", "-v", action="store_true", help="print every check as it runs")
     ap.add_argument("--json", help="also write results to this JSON file")
     ap.add_argument("--no-feedback", action="store_true", help="skip POST /api/feedback (it files a real GitHub issue when the server is configured)")
+    ap.add_argument("--no-discover", action="store_true", help="skip the public Discover steps (share / feed / like / follow / report)")
     args = ap.parse_args()
     VERBOSE = args.verbose
     FEEDBACK = not args.no_feedback
+    DISCOVER = not args.no_discover
     base = args.base.rstrip("/")
     print(f"MMV smoke test against {base}")
     run(base)

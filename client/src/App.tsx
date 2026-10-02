@@ -16,8 +16,28 @@ import CrewPage from "@/pages/crew";
 import SessionPage from "@/pages/session";
 import Closet from "@/pages/closet";
 import JoinPage, { InviteGate } from "@/pages/join";
+import DiscoverPage from "@/pages/discover";
+import PostPage from "@/pages/post";
+import ProfilePage from "@/pages/profile";
+import { SignInPromptHost } from "@/components/sign-in-prompt";
+import { isPublicPath } from "@/lib/discover";
 
-/** Logged-out visitor on #/join/:code → stash the code, then show Welcome with the invite banner. */
+/** Routes that render with or without a token: the Discover feed, a post permalink, a profile. */
+function PublicRoutes() {
+  return (
+    <Switch>
+      <Route path="/discover" component={DiscoverPage} />
+      <Route path="/discover/:vibe" component={DiscoverPage} />
+      <Route path="/p/:id" component={PostPage} />
+      <Route path="/u/:handle" component={ProfilePage} />
+    </Switch>
+  );
+}
+
+/**
+ * Logged-out visitor: #/join/:code → stash the code, then show Welcome with the invite banner;
+ * #/discover, #/p/:id, #/u/:handle render as-is (public); anything else → Welcome.
+ */
 function SignedOut() {
   const [loc, navigate] = useLocation();
   const code = inviteCodeFromPath(loc);
@@ -26,6 +46,7 @@ function SignedOut() {
     setPendingInvite(code);
     navigate("/", { replace: true });
   }, [code, navigate]);
+  if (isPublicPath(loc)) return <PublicRoutes />;
   return <Welcome />;
 }
 
@@ -39,6 +60,10 @@ function SignedIn() {
       <Route path="/crews/:id" component={CrewPage} />
       <Route path="/sessions/:id" component={SessionPage} />
       <Route path="/closet" component={Closet} />
+      <Route path="/discover" component={DiscoverPage} />
+      <Route path="/discover/:vibe" component={DiscoverPage} />
+      <Route path="/p/:id" component={PostPage} />
+      <Route path="/u/:handle" component={ProfilePage} />
       <Route component={NotFound} />
     </Switch>
   );
@@ -66,6 +91,7 @@ function App() {
           <Router hook={useHashLocation}>
             <AppRouter />
             <ReportProblemHost />
+            <SignInPromptHost />
           </Router>
         </TooltipProvider>
       </AuthProvider>

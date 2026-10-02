@@ -1,5 +1,5 @@
 import { Link, useLocation } from "wouter";
-import { Users, Shirt, ChevronLeft, LogOut } from "lucide-react";
+import { Users, Shirt, ChevronLeft, LogOut, LogIn, Compass } from "lucide-react";
 import type { ReactNode } from "react";
 import type { PublicUser } from "@shared/schema";
 import { cn } from "@/lib/utils";
@@ -27,7 +27,10 @@ export function Logo({ className, withWord = true }: { className?: string; withW
   );
 }
 
-export function Avatar({ user, size = "md", className }: { user: PublicUser; size?: "sm" | "md" | "lg"; className?: string }) {
+/** Anything with an id, a name and a colour can be drawn as an avatar (users, post authors, profiles). */
+export type AvatarUser = Pick<PublicUser, "id" | "name" | "color">;
+
+export function Avatar({ user, size = "md", className }: { user: AvatarUser; size?: "sm" | "md" | "lg"; className?: string }) {
   const s = size === "sm" ? "h-7 w-7 text-xs" : size === "lg" ? "h-14 w-14 text-lg" : "h-9 w-9 text-sm";
   return (
     <span
@@ -92,15 +95,27 @@ export function Page({
   );
 }
 
-function TabBar() {
+/**
+ * Bottom tab bar. Discover sits first and is public; the rest of the app needs a token, so a
+ * logged-out visitor sees "Sign in" where "Sign out" normally is (and Crews/Closet route to Welcome).
+ * `tone="overlay"` floats it over the Discover feed (translucent, no report row).
+ */
+export function TabBar({ tone = "default" }: { tone?: "default" | "overlay" }) {
   const [loc] = useLocation();
-  const { logout } = useAuth();
+  const { logout, user } = useAuth();
   const tabs = [
-    { href: "/", label: "Crews", icon: Users, active: loc === "/" || loc.startsWith("/crews") || loc.startsWith("/sessions") },
+    { href: "/discover", label: "Discover", icon: Compass, active: loc.startsWith("/discover") || loc.startsWith("/p/") || loc.startsWith("/u/") },
+    { href: "/", label: "Crews", icon: Users, active: loc === "/" || loc.startsWith("/crews") || loc.startsWith("/sessions") || loc.startsWith("/join") },
     { href: "/closet", label: "Closet", icon: Shirt, active: loc.startsWith("/closet") },
   ];
   return (
-    <nav className="fixed inset-x-0 bottom-0 z-20 mx-auto w-full max-w-md border-t border-border/70 bg-background/90 backdrop-blur safe-bottom">
+    <nav
+      className={cn(
+        "fixed inset-x-0 bottom-0 z-20 mx-auto w-full max-w-md border-t border-border/70 backdrop-blur safe-bottom",
+        tone === "overlay" ? "bg-background/80" : "bg-background/90",
+      )}
+      data-testid="nav-tabbar"
+    >
       <div className="flex items-stretch">
         {tabs.map((t) => (
           <Link
@@ -110,20 +125,32 @@ function TabBar() {
               "flex flex-1 flex-col items-center gap-0.5 py-2.5 text-xs font-medium",
               t.active ? "text-primary" : "text-muted-foreground",
             )}
+            aria-current={t.active ? "page" : undefined}
             data-testid={`link-tab-${t.label.toLowerCase()}`}
           >
             <t.icon className="h-5 w-5" strokeWidth={t.active ? 2.4 : 1.8} />
             {t.label}
           </Link>
         ))}
-        <button
-          onClick={logout}
-          className="flex flex-1 flex-col items-center gap-0.5 py-2.5 text-xs font-medium text-muted-foreground"
-          data-testid="button-logout"
-        >
-          <LogOut className="h-5 w-5" strokeWidth={1.8} />
-          Sign out
-        </button>
+        {user ? (
+          <button
+            onClick={logout}
+            className="flex flex-1 flex-col items-center gap-0.5 py-2.5 text-xs font-medium text-muted-foreground"
+            data-testid="button-logout"
+          >
+            <LogOut className="h-5 w-5" strokeWidth={1.8} />
+            Sign out
+          </button>
+        ) : (
+          <Link
+            href="/"
+            className="flex flex-1 flex-col items-center gap-0.5 py-2.5 text-xs font-medium text-primary"
+            data-testid="link-tab-signin"
+          >
+            <LogIn className="h-5 w-5" strokeWidth={2} />
+            Sign in
+          </Link>
+        )}
       </div>
       <div className="-mt-1 flex items-center justify-center pb-1 text-[11px] text-muted-foreground">
         <button

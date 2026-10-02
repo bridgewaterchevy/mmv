@@ -7,6 +7,13 @@ import {
   pickPhotos,
   reactions,
   feedback,
+  posts,
+  postLikes,
+  follows,
+  postReports,
+  DISCOVER_PAGE_SIZE,
+  DISCOVER_TOP_WINDOW_DAYS,
+  POST_REPORTS_TO_HIDE,
 } from "@shared/schema";
 import type {
   User,
@@ -28,8 +35,17 @@ import type {
   FeedbackReport,
   FeedbackStatus,
   FeedbackKind,
+  Post,
+  PostView,
+  PostVibe,
+  PostStatus,
+  PostStatusReason,
+  PostReport,
+  PostReportView,
+  DiscoverSort,
+  PublicProfile,
 } from "@shared/schema";
-import { and, eq, inArray, desc, asc, count, gte, lt } from "drizzle-orm";
+import { and, eq, inArray, desc, asc, count, gte, lt, sql, ne } from "drizzle-orm";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { getDb } from "./db";
 import type { Db } from "./db";
@@ -58,6 +74,35 @@ const AVATAR_COLORS = [
 export function toPublic(u: User): PublicUser {
   const { pin: _p, token: _t, ...rest } = u;
   return rest;
+}
+
+/** Public display name: the first name only ("Sam Lee-Jones" → "Sam"). Falls back to the handle when blank. */
+export function firstName(u: { name: string; handle: string }): string {
+  const first = (u.name ?? "").trim().split(/\s+/)[0] ?? "";
+  return first || u.handle;
+}
+
+// ---- opaque keyset cursors for the Discover feeds ----
+export interface FeedCursor {
+  t: number; // created_at epoch ms
+  i: number; // post id
+  l?: number; // like_count (sort=top only)
+}
+export function encodeCursor(c: FeedCursor): string {
+  return Buffer.from(JSON.stringify(c), "utf8").toString("base64url");
+}
+/** undefined for a missing/blank cursor; null when it is malformed (callers answer 400). */
+export function decodeCursor(raw: unknown): FeedCursor | null | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  if (typeof raw !== "string" || raw.length > 200) return null;
+  try {
+    const c = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as Partial<FeedCursor>;
+    if (!c || !Number.isFinite(c.t) || !Number.isInteger(c.i)) return null;
+    if (c.l !== undefined && !Number.isInteger(c.l)) return null;
+    return { t: Number(c.t), i: Number(c.i), ...(c.l !== undefined ? { l: Number(c.l) } : {}) };
+  } catch {
+    return null;
+  }
 }
 
 function code(len: number) {
@@ -102,10 +147,17 @@ export class DatabaseStorage {
       .returning();
     return row;
   }
-  async updateUser(id: number, data: { shopFor?: ShopFor | null }): Promise<User> {
+  async getUserById(id: number): Promise<User | undefined> {
+    if (!Number.isInteger(id)) return undefined;
+    const db = await getDb();
+    const [row] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+    return row;
+  }
+  async updateUser(id: number, data: { shopFor?: ShopFor | null; bio?: string | null }): Promise<User> {
     const db = await getDb();
     const set: Partial<typeof users.$inferInsert> = {};
     if (data.shopFor !== undefined) set.shopFor = data.shopFor;
+    if (data.bio !== undefined) set.bio = data.bio?.trim() || null;
     if (Object.keys(set).length === 0) {
       const [row] = await db.select().from(users).where(eq(users.id, id)).limit(1);
       return row;
@@ -278,19 +330,7 @@ export class DatabaseStorage {
     const rxUsers = await this.getUsers(Array.from(new Set(rx.map((r) => r.userId))));
     const reactionViews: ReactionView[] = rx.map((r) => ({ ...r, user: rxUsers.find((u) => u.id === r.userId)! }));
     const photoRows = photos ?? (await this.photosForPick(p.id));
-    // Legacy safety net: a pick without photo rows (back-fill not run yet) behaves like before from its own columns.
-    const agg =
-      photoRows.length > 0
-        ? aggregatePhotos(photoRows)
-        : {
-            items: safeJson<GarmentItem[]>(p.items, []),
-            palette: safeJson<string[]>(p.palette, []),
-            analysisStatus: p.analysisStatus,
-            analysisError: p.analysisError,
-            analyzedAt: p.analyzedAt,
-            summary: null,
-            coverPath: p.photoPath,
-          };
+    const agg = aggregateFor(p, photoRows);
     const photoViews: PickPhotoView[] = photoRows.map((ph) => ({
       id: ph.id,
       url: ph.path,
@@ -396,6 +436,8 @@ export class DatabaseStorage {
         )
         .returning();
       photos.sort((a, b) => a.position - b.position);
+      // A re-post replaces every photo, so a public post of this pick loses all its chosen photos → hidden until re-shared.
+      if (existing) await this.syncPostPhotos(pick.id, tx);
       return { pick, photos, previousPhotoPaths };
     });
   }
@@ -433,6 +475,7 @@ export class DatabaseStorage {
         if (rest[i].position !== i) await tx.update(pickPhotos).set({ position: i }).where(eq(pickPhotos.id, rest[i].id));
       }
       await this.recomputePickAggregates(pickId, tx);
+      await this.syncPostPhotos(pickId, tx);
       return { removed: target };
     });
   }
@@ -529,6 +572,7 @@ export class DatabaseStorage {
     const [pick] = await db.select({ photoPath: picks.photoPath }).from(picks).where(eq(picks.id, pickId)).limit(1);
     await db.transaction(async (tx) => {
       await tx.delete(reactions).where(eq(reactions.pickId, pickId));
+      await tx.delete(posts).where(eq(posts.pickId, pickId)); // explicit, in addition to the FK cascade (likes/reports cascade from posts)
       await tx.delete(pickPhotos).where(eq(pickPhotos.pickId, pickId)); // explicit, in addition to the FK cascade
       await tx.delete(picks).where(eq(picks.id, pickId));
     });
@@ -575,6 +619,336 @@ export class DatabaseStorage {
       .values({ pickId: data.pickId, userId: data.userId, emoji: data.emoji ?? null, comment: data.comment ?? null })
       .returning();
     return row;
+  }
+
+  // ----- Discover: posts / likes / follows / reports (server/discover.ts) -----
+  async getPost(id: number): Promise<Post | undefined> {
+    if (!Number.isInteger(id)) return undefined;
+    const db = await getDb();
+    const [row] = await db.select().from(posts).where(eq(posts.id, id)).limit(1);
+    return row;
+  }
+  async getPostByPick(pickId: number): Promise<Post | undefined> {
+    const db = await getDb();
+    const [row] = await db.select().from(posts).where(eq(posts.pickId, pickId)).limit(1);
+    return row;
+  }
+  /**
+   * Create or update the one post of a pick. `photoIds` must already be validated as a subset of the pick's photos
+   * (stored in pick position order). A hidden/removed post comes back to "active" unless it was hidden by reports or
+   * removed by an admin (sticky reasons) — the caller surfaces `status` so the UI can say "under review".
+   */
+  async upsertPost(data: { pickId: number; userId: number; caption: string | null; vibe: PostVibe; photoIds?: number[] }): Promise<Post> {
+    const db = await getDb();
+    const photoRows = await this.photosForPick(data.pickId);
+    const order = new Map(photoRows.map((p, i) => [p.id, i]));
+    const pickIds = (ids: number[]) => Array.from(new Set(ids.filter((id) => order.has(id)))).sort((a, b) => order.get(a)! - order.get(b)!);
+    const existing = await this.getPostByPick(data.pickId);
+    const now = new Date();
+    if (existing) {
+      // photoIds omitted = keep the current selection; when nothing of it survived (photo removed / re-post) fall back to every photo.
+      const kept = data.photoIds ? pickIds(data.photoIds) : pickIds(existing.photoIds);
+      const photoIds = !data.photoIds && kept.length === 0 ? photoRows.map((p) => p.id) : kept;
+      const sticky = existing.status !== "active" && (existing.statusReason === "reports" || existing.statusReason === "admin");
+      const status: PostStatus = photoIds.length === 0 ? (sticky ? existing.status : "hidden") : sticky ? existing.status : "active";
+      const statusReason: PostStatusReason | null = sticky ? existing.statusReason : photoIds.length === 0 ? "no_photos" : null;
+      const [row] = await db
+        .update(posts)
+        .set({ caption: data.caption, vibe: data.vibe, photoIds, status, statusReason, updatedAt: now })
+        .where(eq(posts.id, existing.id))
+        .returning();
+      return row;
+    }
+    const photoIds = pickIds(data.photoIds ?? photoRows.map((p) => p.id));
+    const [row] = await db
+      .insert(posts)
+      .values({
+        pickId: data.pickId,
+        userId: data.userId,
+        caption: data.caption,
+        vibe: data.vibe,
+        photoIds,
+        likeCount: 0,
+        status: photoIds.length === 0 ? "hidden" : "active",
+        statusReason: photoIds.length === 0 ? "no_photos" : null,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning();
+    return row;
+  }
+  async setPostStatus(id: number, status: PostStatus, reason: PostStatusReason | null): Promise<Post | undefined> {
+    const db = await getDb();
+    const [row] = await db
+      .update(posts)
+      .set({ status, statusReason: status === "active" ? null : reason, updatedAt: new Date() })
+      .where(eq(posts.id, id))
+      .returning();
+    return row;
+  }
+  /**
+   * Keep a post's photo_ids in step with the pick's photos: drop ids that no longer exist; when none are left the
+   * post is hidden (reason no_photos). Called inside the photo-delete / re-post transactions.
+   */
+  async syncPostPhotos(pickId: number, tx?: Db): Promise<void> {
+    const db = tx ?? (await getDb());
+    const [post] = await db.select().from(posts).where(eq(posts.pickId, pickId)).limit(1);
+    if (!post) return;
+    const photoRows = await db.select({ id: pickPhotos.id }).from(pickPhotos).where(eq(pickPhotos.pickId, pickId));
+    const alive = new Set(photoRows.map((p) => p.id));
+    const kept = (post.photoIds ?? []).filter((id) => alive.has(id));
+    if (kept.length === (post.photoIds ?? []).length) return;
+    const hide = kept.length === 0 && post.status === "active";
+    await db
+      .update(posts)
+      .set({ photoIds: kept, ...(hide ? { status: "hidden" as const, statusReason: "no_photos" as const } : {}), updatedAt: new Date() })
+      .where(eq(posts.id, post.id));
+    if (hide) console.log(`[discover] post ${post.id} hidden: no public photo left on pick ${pickId}`);
+  }
+
+  /** Public feed page. `top` = like_count desc, created desc over the last DISCOVER_TOP_WINDOW_DAYS days; `new` = created desc. */
+  async listDiscover(opts: { sort: DiscoverSort; vibe?: PostVibe; cursor?: FeedCursor; limit?: number }): Promise<{ rows: Post[]; nextCursor: string | null }> {
+    const db = await getDb();
+    const limit = Math.min(50, Math.max(1, opts.limit ?? DISCOVER_PAGE_SIZE));
+    const conds = [eq(posts.status, "active")];
+    if (opts.vibe) conds.push(eq(posts.vibe, opts.vibe));
+    const c = opts.cursor;
+    if (opts.sort === "top") {
+      conds.push(gte(posts.createdAt, new Date(Date.now() - DISCOVER_TOP_WINDOW_DAYS * 24 * 60 * 60 * 1000)));
+      if (c) conds.push(sql`(${posts.likeCount}, ${posts.createdAt}, ${posts.id}) < (${c.l ?? 0}::int, ${new Date(c.t).toISOString()}::timestamptz, ${c.i}::int)`);
+    } else if (c) {
+      conds.push(sql`(${posts.createdAt}, ${posts.id}) < (${new Date(c.t).toISOString()}::timestamptz, ${c.i}::int)`);
+    }
+    const order = opts.sort === "top" ? [desc(posts.likeCount), desc(posts.createdAt), desc(posts.id)] : [desc(posts.createdAt), desc(posts.id)];
+    const rows = await db
+      .select()
+      .from(posts)
+      .where(and(...conds))
+      .orderBy(...order)
+      .limit(limit + 1);
+    const page = rows.slice(0, limit);
+    const last = page[page.length - 1];
+    const nextCursor =
+      rows.length > limit && last
+        ? encodeCursor({ t: last.createdAt.getTime(), i: last.id, ...(opts.sort === "top" ? { l: last.likeCount } : {}) })
+        : null;
+    return { rows: page, nextCursor };
+  }
+  /** One user's posts, newest first. `includeHidden` (owner/admin) adds hidden posts; removed ones never show. */
+  async listUserPosts(userId: number, opts: { cursor?: FeedCursor; includeHidden?: boolean; limit?: number }): Promise<{ rows: Post[]; nextCursor: string | null }> {
+    const db = await getDb();
+    const limit = Math.min(50, Math.max(1, opts.limit ?? DISCOVER_PAGE_SIZE));
+    const conds = [eq(posts.userId, userId), opts.includeHidden ? ne(posts.status, "removed") : eq(posts.status, "active")];
+    if (opts.cursor) conds.push(sql`(${posts.createdAt}, ${posts.id}) < (${new Date(opts.cursor.t).toISOString()}::timestamptz, ${opts.cursor.i}::int)`);
+    const rows = await db
+      .select()
+      .from(posts)
+      .where(and(...conds))
+      .orderBy(desc(posts.createdAt), desc(posts.id))
+      .limit(limit + 1);
+    const page = rows.slice(0, limit);
+    const last = page[page.length - 1];
+    return { rows: page, nextCursor: rows.length > limit && last ? encodeCursor({ t: last.createdAt.getTime(), i: last.id }) : null };
+  }
+  /** Admin list: every status (or one), newest first, with the distinct-report count. */
+  async adminListPosts(status?: PostStatus, limit = 100): Promise<(Post & { reportCount: number })[]> {
+    const db = await getDb();
+    const rows = await db
+      .select()
+      .from(posts)
+      .where(status ? eq(posts.status, status) : undefined)
+      .orderBy(desc(posts.updatedAt), desc(posts.id))
+      .limit(limit);
+    if (rows.length === 0) return [];
+    const counts = await db
+      .select({ postId: postReports.postId, value: count() })
+      .from(postReports)
+      .where(inArray(postReports.postId, rows.map((r) => r.id)))
+      .groupBy(postReports.postId);
+    const byId = new Map(counts.map((c) => [c.postId, Number(c.value)]));
+    return rows.map((r) => ({ ...r, reportCount: byId.get(r.id) ?? 0 }));
+  }
+
+  /**
+   * Build PostViews for many posts in a handful of queries. Only public data: chosen photos, aggregated items (decorated
+   * like PickView.items), palette, status, first-name author card. `pickId` only for the owner / admins.
+   */
+  async postViews(rows: Post[], viewer?: User | null, opts: { admin?: boolean } = {}): Promise<PostView[]> {
+    if (rows.length === 0) return [];
+    const db = await getDb();
+    const pickIds = Array.from(new Set(rows.map((r) => r.pickId)));
+    const pickRows = await db.select().from(picks).where(inArray(picks.id, pickIds));
+    const pickById = new Map(pickRows.map((p) => [p.id, p]));
+    const photosById = await this.photosForPicks(pickIds);
+    const authorRows = await db.select().from(users).where(inArray(users.id, Array.from(new Set(rows.map((r) => r.userId)))));
+    const authorById = new Map(authorRows.map((u) => [u.id, u]));
+    const liked = new Set<number>();
+    const following = new Set<number>();
+    if (viewer) {
+      const likes = await db
+        .select({ postId: postLikes.postId })
+        .from(postLikes)
+        .where(and(eq(postLikes.userId, viewer.id), inArray(postLikes.postId, rows.map((r) => r.id))));
+      for (const l of likes) liked.add(l.postId);
+      const fl = await db
+        .select({ followeeId: follows.followeeId })
+        .from(follows)
+        .where(and(eq(follows.followerId, viewer.id), inArray(follows.followeeId, Array.from(authorById.keys()))));
+      for (const f of fl) following.add(f.followeeId);
+    }
+    const out: PostView[] = [];
+    for (const post of rows) {
+      const pick = pickById.get(post.pickId);
+      const author = authorById.get(post.userId);
+      if (!pick || !author) continue; // orphan (pick or user gone) — never surface it
+      const photoRows = photosById.get(pick.id) ?? [];
+      const agg = aggregateFor(pick, photoRows);
+      const chosen = new Set(post.photoIds ?? []);
+      const isMine = !!viewer && viewer.id === post.userId;
+      out.push({
+        id: post.id,
+        caption: post.caption,
+        vibe: post.vibe,
+        createdAt: post.createdAt.toISOString(),
+        likeCount: post.likeCount,
+        likedByMe: liked.has(post.id),
+        photos: photoRows.filter((ph) => chosen.has(ph.id)).map((ph) => ({ id: ph.id, url: ph.path })),
+        items: wrapItems(applyShoppingHints(agg.items, author)),
+        palette: agg.palette,
+        analysisStatus: agg.analysisStatus,
+        author: { id: author.id, name: firstName(author), handle: author.handle, color: author.color, isFollowedByMe: following.has(author.id) },
+        isMine,
+        status: post.status,
+        pickId: isMine || opts.admin ? post.pickId : null,
+      });
+    }
+    return out;
+  }
+  async postView(post: Post, viewer?: User | null, opts: { admin?: boolean } = {}): Promise<PostView | undefined> {
+    const [v] = await this.postViews([post], viewer, opts);
+    return v;
+  }
+
+  async toggleLike(postId: number, userId: number): Promise<{ likeCount: number; likedByMe: boolean }> {
+    const db = await getDb();
+    return db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select({ id: postLikes.id })
+        .from(postLikes)
+        .where(and(eq(postLikes.postId, postId), eq(postLikes.userId, userId)))
+        .limit(1);
+      if (existing) await tx.delete(postLikes).where(eq(postLikes.id, existing.id));
+      else await tx.insert(postLikes).values({ postId, userId, createdAt: new Date() });
+      const [{ value }] = await tx.select({ value: count() }).from(postLikes).where(eq(postLikes.postId, postId));
+      const likeCount = Number(value);
+      await tx.update(posts).set({ likeCount }).where(eq(posts.id, postId));
+      return { likeCount, likedByMe: !existing };
+    });
+  }
+  async toggleFollow(followerId: number, followeeId: number): Promise<{ following: boolean; followerCount: number }> {
+    const db = await getDb();
+    return db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select({ id: follows.id })
+        .from(follows)
+        .where(and(eq(follows.followerId, followerId), eq(follows.followeeId, followeeId)))
+        .limit(1);
+      if (existing) await tx.delete(follows).where(eq(follows.id, existing.id));
+      else await tx.insert(follows).values({ followerId, followeeId, createdAt: new Date() });
+      const [{ value }] = await tx.select({ value: count() }).from(follows).where(eq(follows.followeeId, followeeId));
+      return { following: !existing, followerCount: Number(value) };
+    });
+  }
+  async isFollowing(followerId: number, followeeId: number): Promise<boolean> {
+    const db = await getDb();
+    const [row] = await db
+      .select({ id: follows.id })
+      .from(follows)
+      .where(and(eq(follows.followerId, followerId), eq(follows.followeeId, followeeId)))
+      .limit(1);
+    return !!row;
+  }
+  /** followerCount / followingCount / postCount (active posts) for a user. */
+  async profileCounts(userId: number): Promise<{ followerCount: number; followingCount: number; postCount: number }> {
+    const db = await getDb();
+    const [[fr], [fg], [pc]] = await Promise.all([
+      db.select({ value: count() }).from(follows).where(eq(follows.followeeId, userId)),
+      db.select({ value: count() }).from(follows).where(eq(follows.followerId, userId)),
+      db.select({ value: count() }).from(posts).where(and(eq(posts.userId, userId), eq(posts.status, "active"))),
+    ]);
+    return { followerCount: Number(fr.value), followingCount: Number(fg.value), postCount: Number(pc.value) };
+  }
+  async publicProfile(u: User, viewer?: User | null): Promise<PublicProfile> {
+    const counts = await this.profileCounts(u.id);
+    const isMe = !!viewer && viewer.id === u.id;
+    return {
+      id: u.id,
+      name: firstName(u),
+      handle: u.handle,
+      color: u.color,
+      bio: u.bio ?? null,
+      ...counts,
+      isFollowedByMe: viewer && !isMe ? await this.isFollowing(viewer.id, u.id) : false,
+      isMe,
+    };
+  }
+
+  /**
+   * Record a report. One row per (post, reporterKey): a repeat from the same reporter updates the reason instead of
+   * counting again. When the distinct count reaches POST_REPORTS_TO_HIDE and the post is active it is auto-hidden.
+   */
+  async addReport(data: { postId: number; userId: number | null; reporterKey: string; reason: string }): Promise<{ report: PostReport; reportCount: number; autoHidden: boolean }> {
+    const db = await getDb();
+    return db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select()
+        .from(postReports)
+        .where(and(eq(postReports.postId, data.postId), eq(postReports.reporterKey, data.reporterKey)))
+        .limit(1);
+      let report: PostReport;
+      if (existing) {
+        [report] = await tx.update(postReports).set({ reason: data.reason, userId: data.userId ?? existing.userId }).where(eq(postReports.id, existing.id)).returning();
+      } else {
+        [report] = await tx
+          .insert(postReports)
+          .values({ postId: data.postId, userId: data.userId, reporterKey: data.reporterKey, reason: data.reason, createdAt: new Date() })
+          .returning();
+      }
+      const [{ value }] = await tx.select({ value: count() }).from(postReports).where(eq(postReports.postId, data.postId));
+      const reportCount = Number(value);
+      let autoHidden = false;
+      if (reportCount >= POST_REPORTS_TO_HIDE) {
+        const [hidden] = await tx
+          .update(posts)
+          .set({ status: "hidden", statusReason: "reports", updatedAt: new Date() })
+          .where(and(eq(posts.id, data.postId), eq(posts.status, "active")))
+          .returning({ id: posts.id });
+        autoHidden = !!hidden;
+      }
+      return { report, reportCount, autoHidden };
+    });
+  }
+  /** Admin: newest reports with reporter card and the post's current status. */
+  async listReports(limit = 200): Promise<PostReportView[]> {
+    const db = await getDb();
+    const rows = await db.select().from(postReports).orderBy(desc(postReports.createdAt), desc(postReports.id)).limit(limit);
+    if (rows.length === 0) return [];
+    const reporterIds = Array.from(new Set(rows.map((r) => r.userId).filter((id): id is number => id !== null)));
+    const postRows = await db.select({ id: posts.id, status: posts.status, userId: posts.userId }).from(posts).where(inArray(posts.id, Array.from(new Set(rows.map((r) => r.postId)))));
+    const postById = new Map(postRows.map((p) => [p.id, p]));
+    const userIds = Array.from(new Set([...reporterIds, ...postRows.map((p) => p.userId)]));
+    const people = userIds.length ? await db.select({ id: users.id, name: users.name, handle: users.handle }).from(users).where(inArray(users.id, userIds)) : [];
+    const personById = new Map(people.map((u) => [u.id, u]));
+    return rows.map((r) => {
+      const post = postById.get(r.postId);
+      const reporter = r.userId !== null ? personById.get(r.userId) : undefined;
+      return {
+        ...r,
+        reporter: reporter ? { id: reporter.id, name: reporter.name, handle: reporter.handle } : null,
+        postStatus: post?.status ?? "removed",
+        postAuthorHandle: post ? personById.get(post.userId)?.handle ?? null : null,
+      };
+    });
   }
 
   // ----- feedback ("Report a problem" / "Suggest an idea") -----
@@ -643,6 +1017,24 @@ export class DatabaseStorage {
     const byId = new Map(people.map((u) => [u.id, u]));
     return rows.map((r) => ({ ...r, user: byId.get(r.userId) ?? null }));
   }
+}
+
+/**
+ * Aggregate a pick from its photo rows (server/aggregate.ts). Legacy safety net: a pick without photo rows
+ * (back-fill not run yet) behaves like before from its own columns.
+ */
+function aggregateFor(p: Pick, photoRows: PickPhoto[]) {
+  return photoRows.length > 0
+    ? aggregatePhotos(photoRows)
+    : {
+        items: safeJson<GarmentItem[]>(p.items, []),
+        palette: safeJson<string[]>(p.palette, []),
+        analysisStatus: p.analysisStatus,
+        analysisError: p.analysisError,
+        analyzedAt: p.analyzedAt,
+        summary: null,
+        coverPath: p.photoPath,
+      };
 }
 
 function safeJson<T>(s: string, fallback: T): T {
